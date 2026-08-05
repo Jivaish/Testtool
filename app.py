@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Iterable
@@ -15,6 +17,16 @@ import streamlit as st
 from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+try:
+    import geonamescache
+except Exception:  # pragma: no cover - handled in the UI
+    geonamescache = None
+
+try:
+    import pycountry
+except Exception:  # pragma: no cover - handled in the UI
+    pycountry = None
 
 try:
     from ddgs import DDGS
@@ -68,6 +80,41 @@ INSTITUTION_WORDS = (
     "polytechnic", "teaching hospital", "health sciences", "health-science",
 )
 
+STRONG_INSTITUTION_WORDS = (
+    "university", "college", "school", "hospital", "health system",
+    "medical center", "medical centre", "institute", "academy",
+    "polytechnic", "teaching hospital", "cancer center", "cancer centre",
+    "universidad", "universite", "universitat", "universita",
+    "universidade", "universiteit", "universiti", "universitas",
+    "uniwersytet", "universitet", "hochschule", "hogeschool", "ecole",
+    "faculdade", "instituto", "institut", "akademi", "academia",
+    "hopital", "krankenhaus", "klinikum", "szpital", "ospedale",
+)
+
+ACADEMIC_EVIDENCE_WORDS = (
+    "academic", "academics", "degree", "degrees", "undergraduate",
+    "graduate", "postgraduate", "students", "admissions", "education",
+    "research", "residency", "fellowship", "faculty", "professor",
+    "medical school", "school of medicine", "teaching hospital",
+    "recherche", "forschung", "ricerca", "investigacion", "investigacao",
+    "enseignement", "lehre", "docencia", "estudiantes", "studenten",
+)
+
+NON_INSTITUTION_PHRASES = (
+    "iis windows server", "index of /", "page not found", "access denied",
+    "contact us", "about the head", "continuing medical education",
+    "physician jobs", "job opening", "job vacancies", "locum tenens",
+    "mommy meltdown", "privacy policy", "terms of use", "search results",
+    "find a doctor", "find a provider", "department of", "division of",
+    "university system", "board of trustees",
+    "list of universities", "universities list",
+)
+
+NON_INSTITUTION_PATH_WORDS = (
+    "/jobs", "/careers", "/news", "/article", "/blog", "/events",
+    "/course", "/cme", "/press-release", "/story",
+)
+
 DEPARTMENT_PAGE_WORDS = (
     "department", "school", "college", "faculty", "division", "centre",
     "center", "program", "programme", "specialty", "speciality",
@@ -79,6 +126,92 @@ FACULTY_PAGE_WORDS = (
     "teaching staff", "faculty profiles", "faculty directory", "researchers",
     "professors", "profiles", "profile", "team", "members", "directory",
 )
+
+COUNTRY_NAME_OVERRIDES = {
+    "BO": "Bolivia",
+    "BN": "Brunei",
+    "CD": "Democratic Republic of the Congo",
+    "CG": "Republic of the Congo",
+    "CZ": "Czechia",
+    "GB": "United Kingdom",
+    "IR": "Iran",
+    "KP": "North Korea",
+    "KR": "South Korea",
+    "LA": "Laos",
+    "MD": "Moldova",
+    "PS": "Palestine",
+    "RU": "Russia",
+    "SY": "Syria",
+    "TZ": "Tanzania",
+    "US": "United States",
+    "VA": "Vatican City",
+    "VE": "Venezuela",
+    "VN": "Vietnam",
+}
+
+
+@st.cache_data(show_spinner=False)
+def country_choices() -> list[tuple[str, str]]:
+    if pycountry is None:
+        return []
+    countries = [
+        (COUNTRY_NAME_OVERRIDES.get(item.alpha_2, item.name), item.alpha_2)
+        for item in pycountry.countries
+    ]
+    return sorted(countries, key=lambda item: item[0].casefold())
+
+
+@st.cache_data(show_spinner=False)
+def location_choices(country_code: str) -> list[dict[str, str]]:
+    if pycountry is None or geonamescache is None:
+        return []
+
+    subdivisions = list(pycountry.subdivisions.get(country_code=country_code) or [])
+    subdivision_names = {
+        item.code.split("-", 1)[-1]: item.name
+        for item in subdivisions
+    }
+    choices: list[dict[str, str]] = [
+        {"label": "All regions / nationwide", "value": "", "code": "", "kind": "Nationwide"}
+    ]
+    seen: set[tuple[str, str, str]] = set()
+
+    for item in subdivisions:
+        kind = clean_text(getattr(item, "type", "Region")) or "Region"
+        key = (kind.casefold(), item.name.casefold(), "")
+        if key in seen:
+            continue
+        seen.add(key)
+        choices.append({
+            "label": f"{item.name} - {kind}",
+            "value": item.name,
+            "code": item.code,
+            "kind": kind,
+        })
+
+    cache = geonamescache.GeonamesCache(min_city_population=500)
+    for city in cache.get_cities().values():
+        if city.get("countrycode") != country_code:
+            continue
+        name = clean_text(city.get("name"))
+        if not name:
+            continue
+        parent = subdivision_names.get(clean_text(city.get("admin1code")), "")
+        key = ("city", name.casefold(), parent.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        label = f"{name} - City"
+        if parent and parent.casefold() != name.casefold():
+            label += f", {parent}"
+        choices.append({
+            "label": label,
+            "value": name,
+            "code": clean_text(city.get("admin1code")),
+            "kind": "City",
+        })
+
+    return choices[:1] + sorted(choices[1:], key=lambda item: item["label"].casefold())
 
 
 # ==================================================
@@ -282,6 +415,11 @@ def clean_text(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip()
 
 
+def fold_text(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", clean_text(value))
+    return normalized.encode("ascii", "ignore").decode("ascii").casefold()
+
+
 def normalize_url(url: str) -> str | None:
     if not url:
         return None
@@ -414,7 +552,7 @@ def fetch_pdf_text(session: requests.Session, url: str) -> tuple[str | None, str
     try:
         reader = PdfReader(BytesIO(response.content))
         page_text = []
-        for page in reader.pages[:20]:
+        for page in reader.pages:
             page_text.append(page.extract_text() or "")
         return clean_text("\n".join(page_text)), None
     except Exception as exc:
@@ -484,13 +622,13 @@ COUNTRY_DOMAIN_HINTS = {
 }
 
 
-def ddg_search(query: str, max_results: int = 8) -> list[dict[str, str]]:
+def ddg_search(query: str) -> list[dict[str, str]]:
     if DDGS is None:
         return []
     results: list[dict[str, str]] = []
     try:
         with DDGS() as ddgs:
-            for item in ddgs.text(query, max_results=max_results):
+            for item in ddgs.text(query, max_results=None):
                 href = item.get("href") or item.get("url") or ""
                 title = item.get("title") or ""
                 body = item.get("body") or item.get("snippet") or ""
@@ -501,65 +639,214 @@ def ddg_search(query: str, max_results: int = 8) -> list[dict[str, str]]:
     return results
 
 
-def domain_hints_for_country(country: str) -> list[str]:
+def domain_hints_for_country(country: str, country_code: str = "") -> list[str]:
     key = clean_term(country)
-    return COUNTRY_DOMAIN_HINTS.get(key, [])
+    hints = list(COUNTRY_DOMAIN_HINTS.get(key, []))
+    code = country_code.casefold()
+    if code and code != "us":
+        hints.extend([f".{code}", f".ac.{code}", f".edu.{code}"])
+    seen: set[str] = set()
+    return [hint for hint in hints if not (hint in seen or seen.add(hint))]
 
 
-def build_institution_queries(country: str, region: str, specialty: str, terms: list[str]) -> list[str]:
+def build_institution_queries(
+    country: str,
+    country_code: str,
+    region: str,
+    specialty: str,
+    terms: list[str],
+) -> list[str]:
     location = clean_text(" ".join(part for part in [region, country] if part)).strip()
     primary_term = terms[0] if terms else specialty
     queries = [
-        f"universities in {location} official site",
-        f"medical schools in {location} official site",
-        f"health science universities in {location} official site",
-        f"teaching hospitals academic faculty {location} official",
-        f"{location} {primary_term} faculty directory official",
-        f"{location} {primary_term} department faculty university",
-        f"{location} {primary_term} school faculty official",
-        f"{location} college {primary_term} faculty directory",
+        f'"{location}" university official website -jobs -news',
+        f'"{location}" medical school official website -jobs -news',
+        f'"{location}" health sciences university official website',
+        f'"{location}" academic teaching hospital official website',
+        f'"{location}" "{primary_term}" faculty university official',
+        f'"{location}" "{primary_term}" medical school faculty',
+        f'"{location}" "{primary_term}" college faculty directory',
+        f'"{location}" "{specialty}" academic department faculty',
     ]
-    for hint in domain_hints_for_country(country):
+    for hint in domain_hints_for_country(country, country_code):
         queries.extend([
-            f"site:{hint} {region} {primary_term} faculty",
-            f"site:{hint} {region} {specialty} department",
+            f'site:{hint} "{region or country}" "{primary_term}" faculty',
+            f'site:{hint} "{region or country}" "{specialty}" department',
         ])
     seen: set[str] = set()
     return [q for q in queries if not (q in seen or seen.add(q))]
 
 
-def score_institution_result(url: str, title: str, body: str, country: str, terms: list[str]) -> int:
+def is_academic_domain(host: str) -> bool:
+    return bool(
+        host.endswith(".edu")
+        or re.search(r"\.(?:ac|edu)\.[a-z]{2}$", host)
+        or host.endswith(".nhs.uk")
+    )
+
+
+def score_institution_result(
+    url: str,
+    title: str,
+    body: str,
+    country: str,
+    country_code: str,
+    terms: list[str],
+) -> int:
     host = host_of(url)
     if not host or is_bad_external_source(url):
         return -100
-    combined = f"{url} {title} {body}".lower()
+    combined = fold_text(f"{url} {title} {body}")
+    academic_host = is_academic_domain(host)
     score = 0
-    if any(word in combined for word in INSTITUTION_WORDS):
-        score += 25
-    if any(term in combined for term in terms):
-        score += 15
-    for hint in domain_hints_for_country(country):
+    if academic_host:
+        score += 45
+    if any(word in combined for word in STRONG_INSTITUTION_WORDS):
+        score += 30
+    elif any(word in combined for word in INSTITUTION_WORDS):
+        score += 10
+    if any(fold_text(term) in combined for term in terms):
+        score += 4
+    for hint in domain_hints_for_country(country, country_code):
         if host.endswith(hint.lstrip(".")) or hint in host:
-            score += 20
-    if any(host.endswith(suffix) for suffix in (".edu", ".edu.au", ".edu.in", ".edu.tr", ".ac.uk", ".ac.in")):
-        score += 25
+            score += 12
     if any(word in host for word in ("university", "college", "school", "hospital", "health", "med")):
-        score += 15
+        score += 12
+    if "official" in combined:
+        score += 4
+    if not academic_host and any(path_word in urlparse(url).path.casefold() for path_word in NON_INSTITUTION_PATH_WORDS):
+        score -= 35
+    if not academic_host and any(phrase in combined for phrase in NON_INSTITUTION_PHRASES):
+        score -= 60
     if any(bad in combined for bad in ("ranking", "wikipedia", "linkedin", "facebook", "directory listing")):
-        score -= 40
+        score -= 50
     return score
 
 
-def clean_institution_name(title: str, host: str) -> str:
-    title = clean_text(re.sub(r"\s+[-|].*$", "", title or ""))
-    title = re.sub(r"\b(official site|home|homepage|faculty directory)\b", "", title, flags=re.I)
-    title = clean_text(title.strip(" -|:"))
-    if 4 <= len(title) <= 90:
-        return title
-    parts = organization_root(host).split(".")
-    if parts:
-        return parts[0].replace("-", " ").title()
-    return host
+def clean_institution_name_candidate(value: str) -> str:
+    value = re.sub(r"\b(official site|official website|home|homepage|faculty directory)\b", "", value, flags=re.I)
+    value = re.sub(r"\s+(?:official\s+)?logo\s*$", "", value, flags=re.I)
+    return clean_text(value.strip(" -|:"))
+
+
+def valid_institution_name(value: str, host: str) -> bool:
+    name = clean_institution_name_candidate(value)
+    folded = fold_text(name)
+    words = name.split()
+    if not 2 <= len(name) <= 100 or len(words) > 15:
+        return False
+    if any(phrase in folded for phrase in NON_INSTITUTION_PHRASES):
+        return False
+    if "top ranked university" in folded:
+        return False
+    if re.match(r"^(about|contact|welcome|department|division|faculty|school news)\b", folded):
+        return False
+    if any(mark in folded for mark in ("http://", "https://", "www.")):
+        return False
+    has_identity = any(word in folded for word in STRONG_INSTITUTION_WORDS)
+    has_medical_brand = any(word in folded for word in ("medicine", "health", "clinic", "cancer center", "cancer centre"))
+    is_acronym = name.replace("&", "").replace(" ", "").isalnum() and name.upper() == name and len(name) <= 16
+    return has_identity or has_medical_brand or (is_acronym and is_academic_domain(host))
+
+
+def extract_institution_name(soup: BeautifulSoup, search_title: str, host: str) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    for attribute, weight in (("og:site_name", 120), ("application-name", 115)):
+        meta = soup.find("meta", attrs={"property": attribute}) or soup.find("meta", attrs={"name": attribute})
+        if meta and meta.get("content"):
+            meta_name = clean_text(meta.get("content"))
+            candidates.append((weight, meta_name))
+            for part in re.split(r"\s+(?:\||-|\u2013|\u2014|:)\s+", meta_name):
+                candidates.append((weight + 8, part))
+
+    homepage_title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    for source_title, weight in ((homepage_title, 100), (search_title, 20)):
+        if not source_title:
+            continue
+        candidates.append((weight, source_title))
+        for part in re.split(r"\s+(?:\||-|\u2013|\u2014|:)\s+", source_title):
+            candidates.append((weight + 8, part))
+
+    for anchor in soup.find_all("a", href=True):
+        href = normalize_url(urljoin(f"https://{host}", anchor.get("href", "")))
+        if not href or not related_official_domain(href, host) or urlparse(href).path not in {"", "/"}:
+            continue
+        text = clean_text(anchor.get_text(" ", strip=True))
+        if text:
+            candidates.append((90, text))
+        for image in anchor.find_all("img", alt=True):
+            candidates.append((95, clean_text(image.get("alt"))))
+
+    scored: list[tuple[int, str]] = []
+    for source_weight, raw_name in candidates:
+        name = clean_institution_name_candidate(raw_name)
+        if not valid_institution_name(name, host):
+            continue
+        folded = fold_text(name)
+        score = source_weight
+        score += 45 * any(word in folded for word in ("university", "college", "hospital"))
+        score += 25 * any(
+            word in folded
+            for word in ("school", "institute", "medical center", "medical centre", "cancer center", "cancer centre")
+        )
+        if re.search(r"\s(?:\||-|\u2013|\u2014|:)\s", name):
+            score -= 35
+        score -= max(0, len(name.split()) - 10) * 3
+        scored.append((score, name))
+
+    if not scored:
+        return None
+    return sorted(scored, key=lambda item: (-item[0], len(item[1]), item[1].casefold()))[0][1]
+
+
+def homepage_has_academic_identity(name: str, soup: BeautifulSoup, host: str) -> bool:
+    title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    if any(phrase in fold_text(title) for phrase in NON_INSTITUTION_PHRASES):
+        return False
+    text = fold_text(soup.get_text(" ", strip=True))
+    brand_text = fold_text(f"{name} {title}")
+    if ("system" in host or "university system" in text) and "health system" not in brand_text:
+        return False
+    evidence_count = sum(word in text for word in ACADEMIC_EVIDENCE_WORDS)
+    strong_name = any(word in fold_text(name) for word in STRONG_INSTITUTION_WORDS)
+    if is_academic_domain(host):
+        return strong_name or evidence_count >= 2
+    return strong_name and evidence_count >= 2
+
+
+def homepage_matches_location(
+    name: str,
+    soup: BeautifulSoup,
+    host: str,
+    country: str,
+    country_code: str,
+    region: str,
+    region_code: str,
+    region_kind: str,
+) -> bool:
+    text = clean_text(soup.get_text(" ", strip=True))
+    corpus = f"{name} {text}"
+    folded = fold_text(corpus)
+    if region:
+        if fold_text(region) in folded:
+            return True
+        if region_kind == "City":
+            return False
+        abbreviation = region_code.rsplit("-", 1)[-1].upper()
+        if len(abbreviation) in {2, 3}:
+            return bool(re.search(rf"(?:,\s*|\b){re.escape(abbreviation)}\s+\d{{4,6}}\b", corpus))
+        return False
+
+    code = country_code.casefold()
+    if fold_text(country) in folded:
+        return True
+    if code and host.endswith(f".{code}"):
+        return True
+    if code == "us" and (host.endswith(".edu") or re.search(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", corpus)):
+        return True
+    if code == "gb" and host.endswith(".uk"):
+        return True
+    return False
 
 
 def canonical_institution_url(raw_url: str) -> str | None:
@@ -569,7 +856,10 @@ def canonical_institution_url(raw_url: str) -> str | None:
     parsed = urlparse(normalized)
     if is_bad_external_source(normalized):
         return None
-    return f"{parsed.scheme}://{parsed.netloc}"
+    root_host = organization_root(parsed.hostname or "")
+    if not root_host:
+        return None
+    return f"{parsed.scheme}://{root_host}"
 
 
 # ==================================================
@@ -579,19 +869,21 @@ def canonical_institution_url(raw_url: str) -> str | None:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def discover_institutions(
     country: str,
+    country_code: str,
     region: str,
+    region_code: str,
+    region_kind: str,
     specialty: str,
     custom_keywords: str,
-    max_institutions: int,
 ) -> tuple[list[Institution], list[str]]:
     terms = resolve_terms(specialty, custom_keywords)
-    queries = build_institution_queries(country, region, specialty, terms)
-    session = make_session()
+    queries = build_institution_queries(country, country_code, region, specialty, terms)
     institutions_by_root: dict[str, Institution] = {}
+    candidates_by_root: dict[str, tuple[int, str, dict[str, str]]] = {}
     log: list[str] = []
 
     for query in queries:
-        search_results = ddg_search(query, max_results=8)
+        search_results = ddg_search(query)
         log.append(f"{query}: {len(search_results)} result(s)")
         for result in search_results:
             candidate_url = canonical_institution_url(result["url"])
@@ -600,47 +892,97 @@ def discover_institutions(
             host = host_of(candidate_url)
             root = organization_root(host)
             score = score_institution_result(
-                candidate_url,
+                result["url"],
                 result["title"],
                 result["body"],
                 country,
+                country_code,
                 terms,
             )
-            if score < 20:
+            if score < 35:
                 continue
+            result_text = fold_text(f"{result['url']} {result['title']} {result['body']}")
+            has_specialty_evidence = any(fold_text(term) in result_text for term in terms)
+            enriched_result = {
+                **result,
+                "candidate_url": candidate_url,
+                "specialty_evidence": "1" if has_specialty_evidence else "0",
+            }
+            existing_candidate = candidates_by_root.get(root)
+            existing_has_evidence = bool(existing_candidate and existing_candidate[2]["specialty_evidence"] == "1")
+            if (
+                not existing_candidate
+                or (has_specialty_evidence and not existing_has_evidence)
+                or (has_specialty_evidence == existing_has_evidence and score > existing_candidate[0])
+            ):
+                candidates_by_root[root] = (score, query, enriched_result)
 
-            html, final_url, error = fetch_html(session, candidate_url)
-            if error in {"Blocked or rate limited (403)", "Blocked or rate limited (429)"}:
-                log.append(f"{candidate_url}: blocked during verification")
-            if final_url:
-                final_root = canonical_institution_url(final_url) or candidate_url
-                host = host_of(final_root)
-                root = organization_root(host)
-                candidate_url = final_root
-            page_title = ""
-            if html:
-                soup = BeautifulSoup(html, "html.parser")
-                page_title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
-                score += score_institution_result(candidate_url, page_title, "", country, terms) // 3
+    def verify_candidate(payload: tuple[int, str, dict[str, str]]) -> tuple[str, Institution | None, str]:
+        score, query, result = payload
+        candidate_url = result["candidate_url"]
+        session = make_session()
+        html, final_url, error = fetch_html(session, candidate_url)
+        root = organization_root(host_of(candidate_url))
+        if not html or not final_url:
+            message = f"Rejected {candidate_url}: homepage could not be verified ({error or 'unavailable'})"
+            return root, None, message
 
-            name = clean_institution_name(page_title or result["title"], host)
-            existing = institutions_by_root.get(root)
-            item = Institution(
-                name=name,
-                official_url=candidate_url,
-                host=host,
-                source_query=query,
-                score=score,
+        candidate_url = canonical_institution_url(final_url) or candidate_url
+        host = host_of(candidate_url)
+        root = organization_root(host)
+        soup = BeautifulSoup(html, "html.parser")
+        name = extract_institution_name(soup, result["title"], host)
+        if not name:
+            return root, None, f"Rejected {candidate_url}: no valid institution brand found on homepage"
+        if not homepage_has_academic_identity(name, soup, host):
+            message = f"Rejected {candidate_url}: homepage did not verify an academic or teaching institution"
+            return root, None, message
+        if not homepage_matches_location(name, soup, host, country, country_code, region, region_code, region_kind):
+            location_label = region or country
+            message = f"Rejected {candidate_url}: official homepage did not verify location {location_label}"
+            return root, None, message
+
+        page_title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+        score += score_institution_result(
+            candidate_url,
+            page_title,
+            soup.get_text(" ", strip=True)[:4000],
+            country,
+            country_code,
+            terms,
+        ) // 3
+        item = Institution(
+            name=name,
+            official_url=candidate_url,
+            host=host,
+            source_query=query,
+            score=score,
+        )
+        return root, item, f"Accepted {name}: {candidate_url}"
+
+    eligible_candidates: list[tuple[int, str, dict[str, str]]] = []
+    for payload in candidates_by_root.values():
+        if payload[2]["specialty_evidence"] == "1":
+            eligible_candidates.append(payload)
+        else:
+            log.append(
+                f"Rejected {payload[2]['candidate_url']}: no official search evidence for {specialty}"
             )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        verified = executor.map(verify_candidate, eligible_candidates)
+        for root, item, message in verified:
+            log.append(message)
+            if item is None:
+                continue
+            existing = institutions_by_root.get(root)
             if not existing or item.score > existing.score:
                 institutions_by_root[root] = item
-            if len(institutions_by_root) >= max_institutions * 2:
-                break
 
     institutions = sorted(
         institutions_by_root.values(),
         key=lambda item: (-item.score, item.name.lower()),
-    )[:max_institutions]
+    )
     return institutions, log
 
 
@@ -731,7 +1073,7 @@ def site_search_department_urls(host: str, region: str, specialty: str, terms: l
     results: list[dict[str, str]] = []
     seen: set[str] = set()
     for query in queries:
-        for item in ddg_search(query, max_results=6):
+        for item in ddg_search(query):
             url = normalize_url(item["url"])
             if url and url not in seen:
                 seen.add(url)
@@ -746,8 +1088,6 @@ def discover_department_pages(
     region: str,
     specialty: str,
     terms: list[str],
-    max_candidates: int,
-    max_sitemap_urls: int,
     disallowed_paths: list[str],
 ) -> tuple[list[PageCandidate], list[str], dict[str, str]]:
     session = make_session()
@@ -802,12 +1142,12 @@ def discover_department_pages(
         content = response.text
         if "xml" not in response.headers.get("Content-Type", "").lower() and "<url" not in content.lower():
             continue
-        for found_url in extract_sitemap_urls(content)[:max_sitemap_urls]:
+        for found_url in extract_sitemap_urls(content):
             sitemap_checked += 1
             if found_url.lower().endswith(".xml"):
                 nested_response, _, _ = fetch_response(session, found_url)
                 if nested_response:
-                    for nested_url in extract_sitemap_urls(nested_response.text)[:max_sitemap_urls]:
+                    for nested_url in extract_sitemap_urls(nested_response.text):
                         add_candidate(nested_url, "", "nested_sitemap")
             else:
                 add_candidate(found_url, "", "sitemap")
@@ -826,7 +1166,7 @@ def discover_department_pages(
         add_candidate(final_candidate, title, "common_path", text)
     log.append("Common department paths checked.")
 
-    ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))[:max_candidates]
+    ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
     return ordered, log, page_cache
 
 
@@ -837,7 +1177,7 @@ def discover_department_pages(
 NEXT_LINK_WORDS = {"next", "next page", "more", "more results", "load more", ">"}
 
 
-def find_pagination_links(soup: BeautifulSoup, base_url: str, max_links: int = 25) -> list[str]:
+def find_pagination_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     found: dict[str, None] = {}
     for link in soup.find_all(["a", "link"], rel=True):
         rels = [str(item).lower() for item in (link.get("rel") or [])]
@@ -852,7 +1192,7 @@ def find_pagination_links(soup: BeautifulSoup, base_url: str, max_links: int = 2
             target = normalize_url(urljoin(base_url, anchor.get("href", "")))
             if target and target != normalize_url(base_url):
                 found[target] = None
-    return list(found.keys())[:max_links]
+    return list(found.keys())
 
 
 def looks_faculty_relevant(url: str, link_text: str, terms: list[str]) -> bool:
@@ -1184,7 +1524,6 @@ def discover_faculty_roster(
     department_pages: list[PageCandidate],
     institution: Institution,
     terms: list[str],
-    max_pages: int,
     delay_seconds: float,
     disallowed_paths: list[str],
     seed_cache: dict[str, str] | None = None,
@@ -1199,7 +1538,7 @@ def discover_faculty_roster(
     log: list[str] = []
     blocked: list[str] = []
 
-    while queue and len(visited) < max_pages:
+    while queue:
         raw_url = queue.popleft()
         normalized = normalize_url(raw_url)
         if not normalized or normalized in visited:
@@ -1264,7 +1603,7 @@ def discover_faculty_roster(
             if looks_faculty_relevant(link, link_text, terms):
                 queue.append(link)
 
-        log.append(f"[{len(visited)}/{max_pages}] {final_url}")
+        log.append(f"[{len(visited)} checked] {final_url}")
         if delay_seconds > 0:
             time.sleep(delay_seconds)
 
@@ -1588,7 +1927,6 @@ def crawl_profiles(
     profile_links: list[dict[str, object]],
     institution: Institution,
     roster_entries: list[FacultyEntry],
-    max_profiles: int,
     delay_seconds: float,
     disallowed_paths: list[str],
 ) -> tuple[list[Contact], list[Rejection], list[str], list[str]]:
@@ -1597,7 +1935,7 @@ def crawl_profiles(
     rejections: list[Rejection] = []
     log: list[str] = []
     blocked: list[str] = []
-    for index, link in enumerate(profile_links[:max_profiles], start=1):
+    for index, link in enumerate(profile_links, start=1):
         url = str(link["url"])
         if not path_allowed(url, disallowed_paths):
             log.append(f"Skipped by robots.txt: {url}")
@@ -1612,7 +1950,7 @@ def crawl_profiles(
         contacts.extend(found_contacts)
         rejections.extend(found_rejections)
         log.append(f"{final_url}: {len(found_contacts)} contact(s)")
-        if delay_seconds > 0 and index < min(max_profiles, len(profile_links)):
+        if delay_seconds > 0 and index < len(profile_links):
             time.sleep(delay_seconds)
     return contacts, rejections, log, blocked
 
@@ -1721,9 +2059,6 @@ def process_institution(
     region: str,
     specialty: str,
     custom_keywords: str,
-    max_department_candidates: int,
-    max_pages: int,
-    max_profiles: int,
     delay_seconds: float,
 ) -> tuple[list[Contact], InstitutionReport]:
     terms = resolve_terms(specialty, custom_keywords)
@@ -1740,8 +2075,6 @@ def process_institution(
         region=region,
         specialty=specialty,
         terms=terms,
-        max_candidates=max_department_candidates,
-        max_sitemap_urls=2500,
         disallowed_paths=disallowed_paths,
     )
     report.department_pages = len(department_pages)
@@ -1754,7 +2087,6 @@ def process_institution(
         department_pages=department_pages,
         institution=institution,
         terms=terms,
-        max_pages=max_pages,
         delay_seconds=delay_seconds,
         disallowed_paths=disallowed_paths,
         seed_cache=seed_cache,
@@ -1779,7 +2111,6 @@ def process_institution(
         profile_links=profile_links,
         institution=institution,
         roster_entries=roster_entries,
-        max_profiles=max_profiles,
         delay_seconds=delay_seconds,
         disallowed_paths=disallowed_paths,
     )
@@ -1841,13 +2172,9 @@ st.markdown(
 )
 
 with st.sidebar:
-    st.subheader("Crawl settings")
-    max_institutions = st.slider("Max institutions to discover", 5, 40, 18, 1)
-    max_department_candidates = st.slider("Department pages per institution", 3, 18, 8, 1)
-    max_pages = st.slider("Max faculty pages per institution", 10, 120, 45, 5)
-    max_profiles = st.slider("Max profiles per institution", 10, 180, 70, 10)
+    st.subheader("Request settings")
     delay_seconds = st.slider("Delay between requests", 0.1, 2.0, 0.45, 0.05)
-    st.caption("Higher limits improve recall but take longer and create more requests.")
+    st.caption("All qualifying institutions, pages, and profiles are processed. Larger searches can take longer.")
 
 if "institutions" not in st.session_state:
     st.session_state.institutions = []
@@ -1859,22 +2186,57 @@ if "contacts" not in st.session_state:
     st.session_state.contacts = []
 if "reports" not in st.session_state:
     st.session_state.reports = []
+if "discovery_scope" not in st.session_state:
+    st.session_state.discovery_scope = None
+
+if pycountry is None or geonamescache is None:
+    st.error("Location data packages are unavailable. Install requirements.txt, then run the app again.")
+    st.stop()
+
+countries = country_choices()
+country_names = [name for name, _ in countries]
+country_codes = dict(countries)
+default_country_index = country_names.index("United States") if "United States" in country_names else 0
 
 with st.container(border=True):
     col_a, col_b = st.columns(2)
     with col_a:
-        country = st.text_input("Country", value="United States", placeholder="United States")
-        region = st.text_input("State / Province / Region", value="Alabama", placeholder="Alabama")
+        country = st.selectbox("Country", country_names, index=default_country_index)
+        country_code = country_codes[country]
+        locations = location_choices(country_code)
+        location_labels = [item["label"] for item in locations]
+        default_location_index = 0
+        if country_code == "US":
+            default_location_index = next(
+                (index for index, item in enumerate(locations) if item["value"] == "Alabama" and item["kind"] == "State"),
+                0,
+            )
+        selected_location_label = st.selectbox(
+            "State / Province / Region / City",
+            location_labels,
+            index=default_location_index,
+            key=f"location_{country_code}",
+        )
+        location = next(item for item in locations if item["label"] == selected_location_label)
+        region = location["value"]
+        region_code = location["code"]
+        region_kind = location["kind"]
     with col_b:
         specialty = st.selectbox("Department / Specialty", SPECIALTIES, index=SPECIALTIES.index("Nursing"))
         custom_keywords = st.text_input("Optional additional keywords", placeholder="neonatal nursing, family health")
 
     discover_clicked = st.button("Discover Institutions", type="primary", use_container_width=True)
 
+current_scope = (country, country_code, region, region_code, region_kind, specialty, custom_keywords.strip())
+if st.session_state.discovery_scope and st.session_state.discovery_scope != current_scope:
+    st.session_state.institutions = []
+    st.session_state.institution_log = []
+    st.session_state.selected_institution_names = []
+    st.session_state.contacts = []
+    st.session_state.reports = []
+    st.session_state.discovery_scope = None
+
 if discover_clicked:
-    if not country.strip() or not region.strip():
-        st.error("Please enter both country and state/province/region.")
-        st.stop()
     if specialty == "Custom Department" and not custom_keywords.strip():
         st.error("Custom Department requires at least one keyword.")
         st.stop()
@@ -1883,19 +2245,22 @@ if discover_clicked:
         st.stop()
     with st.status("Discovering official institutions...", expanded=True) as status:
         institutions, institution_log = discover_institutions(
-            country.strip(),
-            region.strip(),
+            country,
+            country_code,
+            region,
+            region_code,
+            region_kind,
             specialty,
             custom_keywords,
-            max_institutions,
         )
         st.write(f"Discovered {len(institutions)} likely official institution site(s).")
         status.update(label="Institution discovery complete.", state="complete")
     st.session_state.institutions = institutions
     st.session_state.institution_log = institution_log
-    st.session_state.selected_institution_names = [item.name for item in institutions[: min(5, len(institutions))]]
+    st.session_state.selected_institution_names = [item.name for item in institutions]
     st.session_state.contacts = []
     st.session_state.reports = []
+    st.session_state.discovery_scope = current_scope
 
 institutions: list[Institution] = st.session_state.institutions
 if institutions:
@@ -1937,13 +2302,10 @@ if institutions:
             status_box.info(f"Checking {institution.name} ({index} of {len(selected)})")
             contacts, report = process_institution(
                 institution=institution,
-                country=country.strip(),
-                region=region.strip(),
+                country=country,
+                region=region,
                 specialty=specialty,
                 custom_keywords=custom_keywords,
-                max_department_candidates=max_department_candidates,
-                max_pages=max_pages,
-                max_profiles=max_profiles,
                 delay_seconds=delay_seconds,
             )
             all_contacts.extend(contacts)

@@ -4,6 +4,8 @@ A ready-to-deploy Streamlit app for finding publicly visible official faculty wo
 
 The app uses web search plus direct official-site crawling. It does not use paid APIs, AI APIs, login-only data, third-party people databases, or guessed email patterns.
 
+Country selection uses the full ISO country list. The location dropdown combines official country subdivisions with searchable city data, and includes an all-regions option.
+
 ## Output
 
 The final table and downloadable CSV contain exactly two columns:
@@ -73,6 +75,10 @@ Try:
 - Department / Specialty: `Nursing`
 
 Then click **Discover Institutions**, select one or more institutions, and click **Search Selected Institutions**.
+
+Institution discovery verifies the root website brand, academic or teaching-health identity, selected location, and selected-specialty evidence before showing a result. Page headlines, job listings, directory sites, default server pages, and out-of-location institutions are rejected.
+
+The crawler does not cap the number of institutions, department pages, faculty pages, profiles, pagination links, sitemap entries, or PDF pages it processes. Broad searches can therefore take longer. The request-delay control remains available to keep crawling polite.
 
 ## Known Limitations
 
