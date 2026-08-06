@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Iterable
-from urllib.parse import parse_qs, quote_plus, urldefrag, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote_plus, unquote, urldefrag, urljoin, urlparse, urlunparse
 
 import pandas as pd
 import requests
@@ -214,6 +214,32 @@ def location_choices(country_code: str) -> list[dict[str, str]]:
     return choices[:1] + sorted(choices[1:], key=lambda item: item["label"].casefold())
 
 
+@st.cache_data(show_spinner=False)
+def location_scope_aliases(
+    country_code: str,
+    region: str,
+    region_code: str,
+    region_kind: str,
+) -> tuple[str, ...]:
+    aliases = {clean_text(region)} if region else set()
+    if not region or region_kind == "City" or geonamescache is None:
+        return tuple(sorted((item for item in aliases if item), key=len, reverse=True))
+
+    admin_code = clean_text(region_code).rsplit("-", 1)[-1]
+    if not admin_code:
+        return tuple(aliases)
+    cache = geonamescache.GeonamesCache(min_city_population=500)
+    for city in cache.get_cities().values():
+        if city.get("countrycode") != country_code:
+            continue
+        if clean_text(city.get("admin1code")).casefold() != admin_code.casefold():
+            continue
+        name = clean_text(city.get("name"))
+        if name:
+            aliases.add(name)
+    return tuple(sorted((item for item in aliases if item), key=len, reverse=True))
+
+
 # ==================================================
 # 2. Department keyword registry
 # ==================================================
@@ -315,7 +341,8 @@ def clean_term(value: str) -> str:
 
 
 def resolve_terms(specialty: str, custom_keywords: str = "") -> list[str]:
-    terms = list(SPECIALTY_TERMS.get(specialty, []))
+    terms = [] if specialty == "Custom Department" else [clean_term(specialty)]
+    terms.extend(SPECIALTY_TERMS.get(specialty, []))
     terms.extend(clean_term(item) for item in (custom_keywords or "").split(","))
     seen: set[str] = set()
     ordered: list[str] = []
@@ -554,7 +581,8 @@ def fetch_pdf_text(session: requests.Session, url: str) -> tuple[str | None, str
         page_text = []
         for page in reader.pages:
             page_text.append(page.extract_text() or "")
-        return clean_text("\n".join(page_text)), None
+        lines = [clean_text(line) for text in page_text for line in text.splitlines()]
+        return "\n".join(line for line in lines if line), None
     except Exception as exc:
         return None, exc.__class__.__name__
 
@@ -625,18 +653,23 @@ COUNTRY_DOMAIN_HINTS = {
 def ddg_search(query: str) -> list[dict[str, str]]:
     if DDGS is None:
         return []
-    results: list[dict[str, str]] = []
-    try:
-        with DDGS() as ddgs:
-            for item in ddgs.text(query, max_results=None):
-                href = item.get("href") or item.get("url") or ""
-                title = item.get("title") or ""
-                body = item.get("body") or item.get("snippet") or ""
-                if href:
-                    results.append({"url": href, "title": title, "body": body, "query": query})
-    except Exception:
-        return []
-    return results
+    for attempt in range(2):
+        results: list[dict[str, str]] = []
+        try:
+            with DDGS(timeout=8) as ddgs:
+                for item in ddgs.text(query, max_results=None):
+                    href = item.get("href") or item.get("url") or ""
+                    title = item.get("title") or ""
+                    body = item.get("body") or item.get("snippet") or ""
+                    if href:
+                        results.append({"url": href, "title": title, "body": body, "query": query})
+        except Exception:
+            results = []
+        if results:
+            return results
+        if attempt == 0:
+            time.sleep(0.4)
+    return []
 
 
 def domain_hints_for_country(country: str, country_code: str = "") -> list[str]:
@@ -656,21 +689,28 @@ def build_institution_queries(
     specialty: str,
     terms: list[str],
 ) -> list[str]:
-    location = clean_text(" ".join(part for part in [region, country] if part)).strip()
+    location = region or country
     primary_term = terms[0] if terms else specialty
+    core_terms = [primary_term]
+    core_terms.extend(term for term in terms[1:] if len(term.split()) == 1)
+    core_terms = list(dict.fromkeys(term for term in core_terms if term))
+    term_query = " OR ".join(f'"{term}"' for term in core_terms)
+    location_query = f'"{location}"'
     queries = [
-        f'"{location}" university official website -jobs -news',
-        f'"{location}" medical school official website -jobs -news',
-        f'"{location}" health sciences university official website',
-        f'"{location}" academic teaching hospital official website',
-        f'"{location}" "{primary_term}" faculty university official',
-        f'"{location}" "{primary_term}" medical school faculty',
-        f'"{location}" "{primary_term}" college faculty directory',
-        f'"{location}" "{specialty}" academic department faculty',
+        f'{location_query} university official website -jobs -news',
+        f'{location_query} medical school official website -jobs -news',
+        f'{location_query} osteopathic medical college official',
+        f'{location_query} osteopathic medical campus official',
+        f'{location_query} health sciences university official website',
+        f'{location_query} academic teaching hospital official website',
+        f'{location_query} ({term_query}) faculty university official',
+        f'{location_query} ({term_query}) medical school faculty',
+        f'{location_query} ({term_query}) college faculty directory',
+        f'{location_query} "{specialty}" academic department faculty',
     ]
     for hint in domain_hints_for_country(country, country_code):
         queries.extend([
-            f'site:{hint} "{region or country}" "{primary_term}" faculty',
+            f'site:{hint} "{region or country}" ({term_query}) faculty',
             f'site:{hint} "{region or country}" "{specialty}" department',
         ])
     seen: set[str] = set()
@@ -739,7 +779,7 @@ def valid_institution_name(value: str, host: str) -> bool:
         return False
     if "top ranked university" in folded:
         return False
-    if re.match(r"^(about|contact|welcome|department|division|faculty|school news)\b", folded):
+    if re.match(r"^(about|contact|welcome|department|division|faculty|school news|how|what|why|when|where|guide|best|top|ranking|rankings)\b", folded):
         return False
     if any(mark in folded for mark in ("http://", "https://", "www.")):
         return False
@@ -805,6 +845,9 @@ def homepage_has_academic_identity(name: str, soup: BeautifulSoup, host: str) ->
         return False
     text = fold_text(soup.get_text(" ", strip=True))
     brand_text = fold_text(f"{name} {title}")
+    if any(marker in text for marker in ("high school", "grades 9-12", "grades 9 through 12")):
+        if not any(marker in brand_text for marker in ("university", "college", "institute", "hospital")):
+            return False
     if ("system" in host or "university system" in text) and "health system" not in brand_text:
         return False
     evidence_count = sum(word in text for word in ACADEMIC_EVIDENCE_WORDS)
@@ -882,8 +925,10 @@ def discover_institutions(
     candidates_by_root: dict[str, tuple[int, str, dict[str, str]]] = {}
     log: list[str] = []
 
-    for query in queries:
-        search_results = ddg_search(query)
+    with ThreadPoolExecutor(max_workers=min(6, len(queries))) as executor:
+        search_groups = list(executor.map(ddg_search, queries))
+
+    for query, search_results in zip(queries, search_groups):
         log.append(f"{query}: {len(search_results)} result(s)")
         for result in search_results:
             candidate_url = canonical_institution_url(result["url"])
@@ -962,7 +1007,12 @@ def discover_institutions(
 
     eligible_candidates: list[tuple[int, str, dict[str, str]]] = []
     for payload in candidates_by_root.values():
-        if payload[2]["specialty_evidence"] == "1":
+        source_query = payload[1].lower()
+        targeted_medical_query = any(phrase in source_query for phrase in (
+            "medical school", "medical college", "osteopathic medical",
+            "health sciences university", "academic teaching hospital",
+        ))
+        if payload[2]["specialty_evidence"] == "1" or targeted_medical_query:
             eligible_candidates.append(payload)
         else:
             log.append(
@@ -1024,15 +1074,17 @@ def discover_sitemaps(session: requests.Session, official_url: str) -> list[str]
     root = url_root(official_url)
     if not root:
         return []
-    sitemap_urls = {f"{root}/sitemap.xml", f"{root}/sitemap_index.xml"}
+    declared_sitemaps: set[str] = set()
     robots_text = fetch_robots_txt(session, official_url)
     if robots_text:
         for line in robots_text.splitlines():
             if line.lower().startswith("sitemap:"):
                 value = normalize_url(line.split(":", 1)[1].strip())
                 if value:
-                    sitemap_urls.add(value)
-    return sorted(sitemap_urls)
+                    declared_sitemaps.add(value)
+    if declared_sitemaps:
+        return sorted(declared_sitemaps)
+    return [f"{root}/sitemap.xml", f"{root}/sitemap_index.xml"]
 
 
 def common_department_paths(official_url: str, terms: list[str]) -> list[str]:
@@ -1040,17 +1092,16 @@ def common_department_paths(official_url: str, terms: list[str]) -> list[str]:
     if not root:
         return []
     slugs: set[str] = set()
-    for term in terms:
-        slug = slugify(term)
+    if terms:
+        primary = terms[0]
+        slugs.update({slugify(primary), re.sub(r"[^a-z0-9]+", "", primary.lower())})
+    for term in terms[1:]:
         compact = re.sub(r"[^a-z0-9]+", "", term.lower())
-        if slug:
-            slugs.add(slug)
-        if compact:
-            slugs.add(compact)
+        if compact and len(compact) <= 8:
+            slugs.update({slugify(term), compact})
+    slugs.discard("")
     prefixes = (
-        "", "department", "departments", "school", "schools", "college",
-        "faculty", "academics", "academic", "education", "medicine",
-        "health-sciences", "clinical", "research", "specialties",
+        "", "department", "departments", "school", "college", "medicine",
     )
     paths: set[str] = set()
     for slug in slugs:
@@ -1063,17 +1114,40 @@ def common_department_paths(official_url: str, terms: list[str]) -> list[str]:
 
 def site_search_department_urls(host: str, region: str, specialty: str, terms: list[str]) -> list[dict[str, str]]:
     primary = terms[0] if terms else specialty
+    short_alias = next(
+        (
+            term
+            for term in terms[1:]
+            if 3 <= len(re.sub(r"[^a-z0-9]+", "", term.lower())) <= 8
+        ),
+        primary,
+    )
+    email_domain = organization_root(host)
     queries = [
         f"site:{host} {primary} faculty",
         f"site:{host} {specialty} department faculty",
         f"site:{host} {primary} people directory",
         f"site:{host} {primary} academic staff",
         f"site:{host} {region} {primary} faculty",
+        f'site:{host} "{short_alias}" faculty email',
+        f'site:{host} orientation "{short_alias}" faculty',
+        f'site:{host} onboarding "{short_alias}" faculty',
+        f'site:{host} "@{email_domain}" "{short_alias}"',
     ]
+    document_aliases = [alias for alias in ("ob/gyn", "ob-gyn") if alias in terms and alias != short_alias]
+    for alias in document_aliases:
+        queries.extend(
+            [
+                f'site:{host} orientation "{alias}" faculty',
+                f'site:{host} "@{email_domain}" "{alias}"',
+            ]
+        )
     results: list[dict[str, str]] = []
     seen: set[str] = set()
-    for query in queries:
-        for item in ddg_search(query):
+    with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+        search_groups = list(executor.map(ddg_search, queries))
+    for query, search_results in zip(queries, search_groups):
+        for item in search_results:
             url = normalize_url(item["url"])
             if url and url not in seen:
                 seen.add(url)
@@ -1102,11 +1176,62 @@ def discover_department_pages(
             return
         if not path_allowed(normalized, disallowed_paths):
             return
+        path = urlparse(normalized).path.lower()
+        query = urlparse(normalized).query.lower()
+        is_pdf = is_pdf_url(normalized)
+        if not is_pdf and (
+            re.search(r"/(?:19|20)\d{2}(?:/|$)", path)
+            or any(marker in path for marker in ("/category/", "/tag/", "/newsletter", "/news/", "/blog/"))
+            or "attachment_id=" in query
+        ):
+            return
+        if any(marker in path for marker in ("/person/", "/profile/")):
+            return
+        if "/person" in path and urlparse(normalized).query:
+            return
         evidence = f"{normalized} {title} {page_text[:2500]}"
+        if is_pdf:
+            document_years = [int(year) for year in re.findall(r"\b(?:19|20)\d{2}\b", evidence)]
+            if document_years and max(document_years) < time.gmtime().tm_year - 3:
+                return
         matched = text_matches_terms(evidence, terms)
-        if not matched:
+        page_identity = f"{path} {clean_text(title).lower()}"
+        has_department_identity = any(word in page_identity for word in (*DEPARTMENT_PAGE_WORDS, *FACULTY_PAGE_WORDS))
+        path_parts = {part for part in path.strip("/").split("/") if part}
+        directory_paths = {
+            "faculty", "faculty-staff", "faculty-and-staff", "faculty-directory",
+            "people", "people-directory", "directory", "staff-directory",
+        }
+        directory_titles = (
+            "faculty & staff", "faculty and staff", "faculty directory",
+            "people directory", "staff directory", "our faculty",
+        )
+        strong_directory_seed = not is_pdf and (
+            bool(path_parts & directory_paths)
+            or any(phrase in clean_text(title).lower() for phrase in directory_titles)
+        )
+        trusted_pdf_seed = is_pdf and source in {"site_search", "document_hub"}
+        if not matched and not strong_directory_seed and not trusted_pdf_seed:
+            return
+        primary_match = bool(terms and terms[0] in clean_text(evidence).lower())
+        short_path_match = any(
+            compact and len(compact) <= 10 and compact in re.sub(r"[^a-z0-9]+", "", normalized.lower())
+            for compact in (re.sub(r"[^a-z0-9]+", "", term.lower()) for term in terms)
+        )
+        trusted_content_seed = strong_directory_seed or trusted_pdf_seed
+        if not primary_match and len(matched) < 2 and not short_path_match and not trusted_content_seed:
+            return
+        exact_specialty_title = bool(terms and terms[0] in clean_text(title).lower())
+        title_candidate = re.split(r"\s+[|\-:]\s+", clean_text(title))[0]
+        if valid_name(title_candidate) and not has_department_identity:
+            return
+        if source != "homepage" and not is_pdf and not (
+            strong_directory_seed or exact_specialty_title or short_path_match
+        ):
             return
         score = relevance_score(normalized, title, page_text, terms)
+        if strong_directory_seed:
+            score = max(score, 25)
         if score <= 0:
             return
         item = PageCandidate(normalized, clean_text(title), matched, source, score)
@@ -1134,7 +1259,8 @@ def discover_department_pages(
         add_candidate(item["url"], item.get("title", ""), "site_search", item.get("body", ""))
     log.append("Official-site search checked.")
 
-    sitemap_checked = 0
+    sitemap_page_urls: set[str] = set()
+    nested_sitemaps: set[str] = set()
     for sitemap in discover_sitemaps(session, institution.official_url):
         response, _, _ = fetch_response(session, sitemap)
         if not response:
@@ -1143,18 +1269,54 @@ def discover_department_pages(
         if "xml" not in response.headers.get("Content-Type", "").lower() and "<url" not in content.lower():
             continue
         for found_url in extract_sitemap_urls(content):
-            sitemap_checked += 1
             if found_url.lower().endswith(".xml"):
-                nested_response, _, _ = fetch_response(session, found_url)
-                if nested_response:
-                    for nested_url in extract_sitemap_urls(nested_response.text):
-                        add_candidate(nested_url, "", "nested_sitemap")
+                nested_sitemaps.add(found_url)
             else:
-                add_candidate(found_url, "", "sitemap")
-    log.append(f"Sitemap URLs checked: {sitemap_checked}")
+                sitemap_page_urls.add(found_url)
 
-    for candidate_url in common_department_paths(institution.official_url, terms):
-        html, final_candidate, _ = fetch_html(session, candidate_url)
+    def fetch_nested_sitemap(sitemap_url: str) -> list[str]:
+        nested_session = make_session()
+        nested_response, _, _ = fetch_response(nested_session, sitemap_url)
+        if not nested_response:
+            return []
+        return extract_sitemap_urls(nested_response.text)
+
+    with ThreadPoolExecutor(max_workers=min(4, len(nested_sitemaps) or 1)) as executor:
+        nested_results = executor.map(fetch_nested_sitemap, sorted(nested_sitemaps))
+        for found_urls in nested_results:
+            for found_url in found_urls:
+                if found_url.lower().endswith(".xml"):
+                    continue
+                sitemap_page_urls.add(found_url)
+
+    for sitemap_url in sorted(sitemap_page_urls):
+        add_candidate(sitemap_url, "", "sitemap")
+    log.append(f"Sitemap URLs checked: {len(sitemap_page_urls)}")
+
+    root = url_root(institution.official_url)
+    common_paths = set(common_department_paths(institution.official_url, terms))
+    if root:
+        common_paths.update(
+            {
+                f"{root}/faculty",
+                f"{root}/faculty-staff",
+                f"{root}/faculty-and-staff",
+                f"{root}/people",
+                f"{root}/directory",
+                f"{root}/staff-directory",
+                f"{root}/orientation",
+                f"{root}/onboarding",
+            }
+        )
+
+    def probe_common_path(candidate_url: str) -> tuple[str, str | None, str | None]:
+        probe_session = make_session()
+        html, final_candidate, _ = fetch_html(probe_session, candidate_url)
+        return candidate_url, html, final_candidate
+
+    with ThreadPoolExecutor(max_workers=min(4, len(common_paths) or 1)) as executor:
+        common_results = list(executor.map(probe_common_path, sorted(common_paths)))
+    for candidate_url, html, final_candidate in common_results:
         if not html or not final_candidate:
             continue
         if not related_official_domain(final_candidate, official_host):
@@ -1164,6 +1326,14 @@ def discover_department_pages(
         text = clean_text(soup.get_text(" ", strip=True))
         page_cache[final_candidate] = html
         add_candidate(final_candidate, title, "common_path", text)
+        for anchor in soup.find_all("a", href=True):
+            document_url = normalize_url(urljoin(final_candidate, anchor.get("href", "")))
+            if document_url and is_pdf_url(document_url):
+                add_candidate(
+                    document_url,
+                    clean_text(anchor.get_text(" ", strip=True)),
+                    "document_hub",
+                )
     log.append("Common department paths checked.")
 
     ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
@@ -1200,6 +1370,37 @@ def looks_faculty_relevant(url: str, link_text: str, terms: list[str]) -> bool:
     return bool(text_matches_terms(combined, terms)) or any(word in combined for word in FACULTY_PAGE_WORDS)
 
 
+def should_follow_faculty_link(
+    source_url: str,
+    target_url: str,
+    link_text: str,
+    source_has_department_terms: bool,
+    terms: list[str],
+) -> bool:
+    combined = f"{target_url} {link_text}".lower()
+    if text_matches_terms(combined, terms):
+        return True
+    if looks_like_profile_url(target_url, link_text):
+        return False
+    if not source_has_department_terms or not any(word in combined for word in FACULTY_PAGE_WORDS):
+        return False
+    source_parts = {part for part in urlparse(source_url).path.lower().split("/") if len(part) >= 4}
+    target_parts = {part for part in urlparse(target_url).path.lower().split("/") if len(part) >= 4}
+    generic_parts = {"about", "academics", "department", "departments", "faculty", "people", "staff", "medicine"}
+    return bool((source_parts - generic_parts) & (target_parts - generic_parts))
+
+
+def page_is_department_scoped(page_url: str, title: str, terms: list[str]) -> bool:
+    header = clean_text(f"{page_url} {title}").lower()
+    if terms and terms[0] in header:
+        return True
+    compact_url = re.sub(r"[^a-z0-9]+", "", page_url.lower())
+    return any(
+        compact and len(compact) <= 10 and compact in compact_url
+        for compact in (re.sub(r"[^a-z0-9]+", "", term.lower()) for term in terms)
+    )
+
+
 PROFILE_HINTS = (
     "/profile", "/profiles", "/people", "/person", "/faculty", "/staff",
     "/directory", "/bio", "/biography",
@@ -1207,8 +1408,12 @@ PROFILE_HINTS = (
 
 
 def looks_like_profile_url(url: str, link_text: str = "") -> bool:
-    combined = f"{url} {link_text}".lower()
-    if not any(hint in combined for hint in PROFILE_HINTS):
+    lowered_url = url.lower()
+    lowered_text = clean_text(link_text).lower()
+    combined = f"{lowered_url} {lowered_text}"
+    if not any(hint in lowered_url for hint in PROFILE_HINTS) and not any(
+        word in lowered_text for word in ("profile", "biography", "bio", "view faculty")
+    ):
         return False
     if any(bad in combined for bad in ("browse?", "search?", "filter=", "page=", "department=")):
         return False
@@ -1224,7 +1429,11 @@ CREDENTIALS = {
     "RN", "DPT", "PT", "DNP", "MSN", "FACOG", "FRCOG", "FACS", "FAAP",
     "MBA", "JD", "PHARMD", "DDS", "DMD", "SCD", "EDD", "BSN", "CNM",
     "MHA", "FACC", "FRCP", "FRCS", "MRCP", "MPHIL", "BA", "BS", "MPT",
+    "MSPH", "MSCR", "MSCI", "DHA", "CMPE",
+    "MLIS", "FACOI", "FACOFP", "FACEP", "FAAEM", "FACOOG", "MSCP", "FNPC",
 }
+
+NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
 NAME_PARTICLES = {
     "de", "del", "della", "da", "di", "van", "von", "der", "den",
@@ -1245,6 +1454,7 @@ NAME_STOPWORDS = {
     "publications", "biography", "administrative", "assistant",
     "coordinator", "manager", "team", "student", "students", "alumni",
     "search", "menu", "clinical", "trials", "care", "patient", "services",
+    "utility", "navigation", "helpful", "links", "annual", "report",
 }
 
 NAME_TOKEN_RE = re.compile(r"^[A-Za-z\u00C0-\u024F'.-]+$")
@@ -1282,7 +1492,7 @@ EXCLUSION_REASON_PATTERNS = [
         r"(?!\s+of\s+the\s+(?:american|royal|national|international)\b)",
         "Fellow",
     ),
-    (r"\bfellowship\b", "Fellowship role"),
+    (r"\bfellowship\s+(?:trainee|position|appointment)\b", "Fellowship role"),
     (r"\bpostdoctoral\b|\bpostdoc\b", "Postdoctoral role"),
     (r"\bresearch\s+assistant\b|\bgraduate\s+assistant\b|\bteaching\s+assistant\b", "Assistant role"),
     (r"\bresearch\s+coordinator\b|\bprogram\s+coordinator\b|\bdepartment\s+coordinator\b|\bcoordinator\b", "Coordinator role"),
@@ -1313,6 +1523,13 @@ def clean_name(value: str) -> str:
     value = re.sub(r"^(?:Dr\.?|Prof\.?|Professor|Mr\.?|Ms\.?|Mrs\.?)\s+", "", value, flags=re.I)
     value = re.sub(r"\s+[|\-:]\s+.*$", "", value)
     value = strip_credentials(value)
+    comma_parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(comma_parts) >= 2 and len(comma_parts[0].split()) == 1:
+        suffix = ""
+        if compact_local(comma_parts[-1]).upper() in NAME_SUFFIXES:
+            suffix = f", {comma_parts.pop()}"
+        if len(comma_parts) == 2:
+            value = f"{comma_parts[1]} {comma_parts[0]}{suffix}"
     return value.strip(" ,;|-:")
 
 
@@ -1347,6 +1564,7 @@ def valid_name(value: str) -> bool:
 
 def normalize_person_name(name: str) -> str:
     value = clean_name(name)
+    value = value.replace(".", "")
     value = re.sub(r"\b(?:" + "|".join(sorted(CREDENTIALS)) + r")\b\.?", "", value, flags=re.I)
     value = re.sub(r"[^A-Za-z\u00C0-\u024F' -]+", " ", value)
     return clean_text(value).casefold()
@@ -1379,6 +1597,13 @@ def roster_name_match(candidate: str, roster_names: set[str]) -> bool:
         for roster_name in roster_names:
             roster_parts = roster_name.split()
             if len(roster_parts) >= 2 and first_last == f"{roster_parts[0]} {roster_parts[-1]}":
+                return True
+            if (
+                len(roster_parts) >= 2
+                and parts[-1] == roster_parts[-1]
+                and parts[0][:1] == roster_parts[0][:1]
+                and (len(parts[0]) == 1 or len(roster_parts[0]) == 1)
+            ):
                 return True
     return False
 
@@ -1425,6 +1650,32 @@ def decode_visible_emails(text: str) -> set[str]:
     return {trim_run_on_email(email) for email in values if email}
 
 
+def decode_protected_script_emails(node: BeautifulSoup | Tag) -> set[str]:
+    emails: set[str] = set()
+    for script in node.find_all("script"):
+        source = script.string or script.get_text(" ", strip=True)
+        if not source or "decodeURIComponent" not in source:
+            continue
+
+        for match in re.finditer(r"decodeURIComponent\(\s*(['\"])(.*?)\1\s*\)", source, flags=re.S):
+            encoded = match.group(2)
+            if encoded != "o":
+                emails.update(decode_visible_emails(unquote(encoded)))
+
+        alphabet_match = re.search(r"var\s+ml\s*=\s*(['\"])(.*?)\1", source, flags=re.S)
+        indexes_match = re.search(r"\bmi\s*=\s*(['\"])(.*?)\1", source, flags=re.S)
+        if alphabet_match and indexes_match:
+            alphabet = alphabet_match.group(2)
+            indexes = indexes_match.group(2)
+            decoded = "".join(
+                alphabet[index]
+                for character in indexes
+                if 0 <= (index := ord(character) - 48) < len(alphabet)
+            )
+            emails.update(decode_visible_emails(unquote(decoded)))
+    return emails
+
+
 def trim_run_on_email(email: str) -> str:
     local, sep, domain = email.partition("@")
     if not sep:
@@ -1445,11 +1696,22 @@ def extract_name_from_node(node: Tag) -> str | None:
         candidate = clean_name(anchor.get_text(" ", strip=True))
         if valid_name(candidate):
             return candidate
+    if node.name == "tr":
+        cells = node.find_all(["td", "th"], recursive=False)
+        if len(cells) >= 2:
+            surname = clean_text(cells[0].get_text(" ", strip=True))
+            given_names = clean_text(cells[1].get_text(" ", strip=True))
+            candidate = clean_name(f"{given_names} {surname}")
+            if valid_name(candidate):
+                return candidate
     return None
 
 
 def collect_names_in_node(node: Tag, limit: int = 6) -> set[str]:
     names: set[str] = set()
+    node_name = extract_name_from_node(node)
+    if node_name:
+        names.add(normalize_person_name(node_name))
     for selector in (*NAME_SELECTORS, "a[href]"):
         for child in node.select(selector):
             candidate = clean_name(child.get_text(" ", strip=True))
@@ -1461,12 +1723,16 @@ def collect_names_in_node(node: Tag, limit: int = 6) -> set[str]:
 
 
 def extract_title_text(node: Tag, full_text: str, name: str | None) -> str:
+    fallback = None
     for selector in TITLE_SELECTORS:
-        element = node.select_one(selector)
-        if element:
+        for element in node.select(selector):
             value = clean_text(element.get_text(" ", strip=True))
             if 3 <= len(value) <= 220:
-                return value
+                fallback = fallback or value
+                if matched_allowed_title(value) or excluded_role_reason(value):
+                    return value
+    if fallback:
+        return fallback
     if name:
         index = full_text.find(name)
         if index != -1:
@@ -1480,12 +1746,37 @@ def page_has_js_only_signals(soup: BeautifulSoup, text: str) -> bool:
     return len(text) < 250 and (len(scripts) >= 4 or bool(app_roots))
 
 
+def faculty_candidate_nodes(soup: BeautifulSoup) -> list[Tag]:
+    nodes: list[Tag] = list(soup.select(CANDIDATE_NODE_SELECTOR))
+    seen = {id(node) for node in nodes}
+    for heading in soup.find_all(["h2", "h3", "h4", "h5"]):
+        name = clean_name(heading.get_text(" ", strip=True))
+        if not valid_name(name):
+            continue
+        current: Tag = heading
+        for _ in range(5):
+            parent = current.parent
+            if not isinstance(parent, Tag):
+                break
+            current = parent
+            text = clean_text(current.get_text(" ", strip=True))
+            if not 10 <= len(text) <= 2000:
+                continue
+            title_text = extract_title_text(current, text, name)
+            if matched_allowed_title(title_text) or excluded_role_reason(title_text):
+                if id(current) not in seen:
+                    seen.add(id(current))
+                    nodes.append(current)
+                break
+    return nodes
+
+
 def extract_roster_entries_from_soup(page_url: str, soup: BeautifulSoup) -> tuple[list[FacultyEntry], list[Rejection]]:
     entries: list[FacultyEntry] = []
     rejections: list[Rejection] = []
-    seen: set[str] = set()
+    entries_by_name: dict[str, FacultyEntry] = {}
 
-    for node in soup.select(CANDIDATE_NODE_SELECTOR):
+    for node in faculty_candidate_nodes(soup):
         text = clean_text(node.get_text(" ", strip=True))
         if not 10 <= len(text) <= 2000:
             continue
@@ -1500,23 +1791,27 @@ def extract_roster_entries_from_soup(page_url: str, soup: BeautifulSoup) -> tupl
                 rejections.append(Rejection(name=name, reason=reason, source_url=page_url, detail=title_text[:220]))
             continue
         normalized = normalize_person_name(name)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
         profile_url = None
         for anchor in node.find_all("a", href=True):
             target = normalize_url(urljoin(page_url, anchor.get("href", "")))
             if target and looks_like_profile_url(target, anchor.get_text(" ", strip=True)):
                 profile_url = target
                 break
-        entries.append(FacultyEntry(
+        existing = entries_by_name.get(normalized)
+        if existing:
+            if not existing.profile_url and profile_url:
+                existing.profile_url = profile_url
+            continue
+        entry = FacultyEntry(
             name=name,
             normalized_name=normalized,
             title=allowed.title(),
             source_url=page_url,
-            evidence=text[:600],
+            evidence=text[:2000],
             profile_url=profile_url,
-        ))
+        )
+        entries.append(entry)
+        entries_by_name[normalized] = entry
     return entries, rejections
 
 
@@ -1551,11 +1846,7 @@ def discover_faculty_roster(
         visited.add(normalized)
 
         if is_pdf_url(normalized):
-            text, error = fetch_pdf_text(session, normalized)
-            if error:
-                blocked.append(f"{normalized}: {error}")
-            elif text and text_matches_terms(text, terms):
-                faculty_pages.append(normalized)
+            faculty_pages.append(normalized)
             continue
 
         html = page_cache.get(normalized)
@@ -1583,8 +1874,14 @@ def discover_faculty_roster(
 
         if text_matches_terms(f"{final_url} {title} {page_text}", terms):
             found_entries, found_rejections = extract_roster_entries_from_soup(final_url, soup)
+            department_scoped = page_is_department_scoped(final_url, title, terms)
             for entry in found_entries:
-                roster.setdefault(entry.normalized_name, entry)
+                if department_scoped or text_matches_terms(entry.evidence, terms):
+                    roster.setdefault(entry.normalized_name, entry)
+                else:
+                    rejections.append(
+                        Rejection(entry.name, "Outside requested department", final_url, entry.title)
+                    )
             rejections.extend(found_rejections)
 
         for page_link in find_pagination_links(soup, final_url):
@@ -1600,7 +1897,13 @@ def discover_faculty_roster(
             if not path_allowed(link, disallowed_paths):
                 continue
             link_text = clean_text(anchor.get_text(" ", strip=True))
-            if looks_faculty_relevant(link, link_text, terms):
+            if should_follow_faculty_link(
+                final_url,
+                link,
+                link_text,
+                bool(text_matches_terms(f"{final_url} {title} {page_text}", terms)),
+                terms,
+            ):
                 queue.append(link)
 
         log.append(f"[{len(visited)} checked] {final_url}")
@@ -1608,6 +1911,45 @@ def discover_faculty_roster(
             time.sleep(delay_seconds)
 
     return list(roster.values()), sorted(set(faculty_pages)), rejections, page_cache, log, blocked
+
+
+def filter_roster_to_location(
+    roster_entries: list[FacultyEntry],
+    country_code: str,
+    region: str,
+    region_code: str,
+    region_kind: str,
+) -> list[FacultyEntry]:
+    if not region:
+        return roster_entries
+    aliases = location_scope_aliases(country_code, region, region_code, region_kind)
+    if not aliases:
+        return roster_entries
+
+    labeled: list[FacultyEntry] = []
+    matching: set[str] = set()
+    for entry in roster_entries:
+        if not re.search(r"\b(?:campus|location)\s*:", entry.evidence, flags=re.I):
+            continue
+        labeled.append(entry)
+        folded_evidence = fold_text(entry.evidence)
+        if any(
+            re.search(
+                rf"\b(?:campus|location)\s*:\s*[^:]{{0,80}}\b{re.escape(fold_text(alias))}\b",
+                folded_evidence,
+            )
+            for alias in aliases
+        ):
+            matching.add(entry.normalized_name)
+
+    if len(labeled) < 2 or not matching:
+        return roster_entries
+    labeled_names = {entry.normalized_name for entry in labeled}
+    return [
+        entry
+        for entry in roster_entries
+        if entry.normalized_name not in labeled_names or entry.normalized_name in matching
+    ]
 
 
 def discover_profile_links(
@@ -1629,15 +1971,28 @@ def discover_profile_links(
             score = 20
             if valid_name(text) and roster_name_match(text, roster_names):
                 score += 60
-            elif valid_name(text):
-                score += 20
+            else:
+                continue
             item = {"url": target, "text": text, "score": score, "from": page_url}
             if target not in links or score > int(links[target]["score"]):
                 links[target] = item
     for entry in roster_entries:
         if entry.profile_url and entry.profile_url not in links:
             links[entry.profile_url] = {"url": entry.profile_url, "text": entry.name, "score": 90, "from": entry.source_url}
-    return sorted(links.values(), key=lambda item: (-int(item["score"]), str(item["url"])))
+    by_identity: dict[str, dict[str, object]] = {}
+    for item in links.values():
+        url = str(item["url"])
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        identifier = next(
+            (values[0] for key in ("id", "uid", "person_id", "profile_id") if (values := query.get(key))),
+            "",
+        )
+        identity = f"{organization_root(parsed.hostname or '')}:{identifier}" if identifier else url
+        existing = by_identity.get(identity)
+        if not existing or int(item["score"]) > int(existing["score"]):
+            by_identity[identity] = item
+    return sorted(by_identity.values(), key=lambda item: (-int(item["score"]), str(item["url"])))
 
 
 # ==================================================
@@ -1688,6 +2043,31 @@ def email_domain_belongs(email_domain: str, official_host: str) -> bool:
     )
 
 
+def looks_institutional_email_domain(domain: str) -> bool:
+    domain = domain.lower().removeprefix("www.")
+    if is_academic_domain(domain):
+        return True
+    if domain.endswith(".gov") or re.search(r"\.gov\.[a-z]{2}$", domain):
+        return True
+    labels = set(re.split(r"[.\-]", domain))
+    return bool(labels & {"university", "college", "hospital", "health", "medical", "medicine", "clinic"})
+
+
+def looks_affiliated_institutional_domain(domain: str, official_host: str) -> bool:
+    if not looks_institutional_email_domain(domain):
+        return False
+    domain_label = organization_root(domain).split(".", 1)[0]
+    official_label = organization_root(official_host).split(".", 1)[0]
+    generic = {"university", "college", "hospital", "health", "medical", "medicine", "clinic", "center", "centre"}
+    domain_tokens = {token for token in re.split(r"[^a-z0-9]+", domain_label) if token and token not in generic}
+    official_tokens = {token for token in re.split(r"[^a-z0-9]+", official_label) if token and token not in generic}
+    return any(
+        len(left) >= 3 and len(right) >= 3 and (left in right or right in left)
+        for left in domain_tokens
+        for right in official_tokens
+    )
+
+
 def classify_email(email: str, official_host: str) -> tuple[bool, str | None]:
     email = trim_run_on_email(email)
     if not EMAIL_RE.fullmatch(email):
@@ -1698,7 +2078,7 @@ def classify_email(email: str, official_host: str) -> tuple[bool, str | None]:
         return False, "Personal email domain"
     if local_compact in GENERIC_EMAIL_PREFIXES:
         return False, "Generic email"
-    if not email_domain_belongs(domain, official_host):
+    if not email_domain_belongs(domain, official_host) and not looks_affiliated_institutional_domain(domain, official_host):
         return False, "Outside official domain family"
     return True, None
 
@@ -1718,6 +2098,7 @@ def emails_in_local_block(block: Tag, block_text: str) -> set[str]:
         if address:
             emails.update(decode_visible_emails(f"{address} {anchor.get_text(' ', strip=True)}"))
     emails.update(decode_visible_emails(block_text))
+    emails.update(decode_protected_script_emails(block))
     return emails
 
 
@@ -1756,6 +2137,11 @@ def extract_emails_with_context(soup: BeautifulSoup | Tag, page_text: str) -> di
         for email in decode_visible_emails(f"{address} {anchor.get_text(' ', strip=True)}"):
             add(email, context, "mailto", context)
 
+    for element in soup.select("[data-enc-email], a.mail-link"):
+        context = ancestor_context(element)
+        for email in decode_visible_emails(element.get_text(" ", strip=True)):
+            add(email, context, "protected_attribute", context)
+
     for match in EMAIL_RE.finditer(page_text or ""):
         raw = trim_run_on_email(match.group(0))
         start = max(0, match.start() - 260)
@@ -1768,12 +2154,15 @@ def extract_emails_with_context(soup: BeautifulSoup | Tag, page_text: str) -> di
         if email not in occurrences:
             add(email, page_text[:700], "obfuscated", page_text[:700])
 
+    for email in decode_protected_script_emails(soup):
+        add(email, page_text[:700], "protected_script", page_text[:700])
+
     return occurrences
 
 
 def is_displayed_contact(entries: list[dict[str, str]]) -> bool:
     for entry in entries:
-        if entry["source"] == "mailto":
+        if entry["source"] in {"mailto", "protected_attribute", "protected_script"}:
             return True
         before = entry.get("before", "")[-80:]
         if CONTACT_LABEL_RE.search(before):
@@ -1876,6 +2265,7 @@ def parse_profile_page(
     roster_names = {entry.normalized_name for entry in roster_entries}
     roster_by_name = {entry.normalized_name: entry for entry in roster_entries}
     soup = BeautifulSoup(html, "html.parser")
+    protected_emails = decode_protected_script_emails(soup)
     for tag in soup(["script", "style", "noscript", "nav", "footer", "form"]):
         tag.decompose()
     page_text = clean_text(soup.get_text(" ", strip=True))
@@ -1906,6 +2296,12 @@ def parse_profile_page(
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
     contexts = extract_emails_with_context(soup, page_text)
+    for email in protected_emails:
+        contexts.setdefault(email, []).append({
+            "context": page_text[:700],
+            "source": "protected_script",
+            "before": page_text[:700],
+        })
     for email, occurrences in sorted(contexts.items()):
         if any(is_admin_context(item["context"]) for item in occurrences):
             rejections.append(Rejection(display_name, "Administrative or alternate contact email", url, email))
@@ -1920,6 +2316,71 @@ def parse_profile_page(
             rejections.append(Rejection(display_name, reason, url, email))
     if not contacts:
         rejections.append(Rejection(display_name, "No visible institutional email", url))
+    return contacts, rejections
+
+
+def fetch_public_profile_payload(
+    session: requests.Session,
+    profile_url: str,
+    html: str,
+) -> tuple[dict[str, object] | None, str | None]:
+    if "/javascript/configuration.js" not in html:
+        return None, None
+    match = re.match(r"^/(\d+)(?:-|$)", urlparse(profile_url).path)
+    root = url_root(profile_url)
+    if not match or not root:
+        return None, None
+    api_url = f"{root}/api/users/{match.group(1)}"
+    response, _, error = fetch_response(session, api_url)
+    if not response:
+        return None, error or "Public profile API unavailable"
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, "Public profile API returned invalid JSON"
+    if not isinstance(payload, dict):
+        return None, "Public profile API returned an unexpected record"
+    return payload, None
+
+
+def parse_public_profile_payload(
+    profile_url: str,
+    payload: dict[str, object],
+    institution: Institution,
+    roster_entries: list[FacultyEntry],
+) -> tuple[list[Contact], list[Rejection]]:
+    first_name = clean_text(payload.get("firstName"))
+    last_name = clean_text(payload.get("lastName"))
+    name = clean_name(clean_text(payload.get("firstNameLastName")) or f"{first_name} {last_name}")
+    roster_names = {entry.normalized_name for entry in roster_entries}
+    if not valid_name(name) or not roster_name_match(name, roster_names):
+        return [], [Rejection(name or "Unknown profile", "Not on approved roster", profile_url)]
+
+    matched_entry = next(
+        (entry for entry in roster_entries if roster_name_match(name, {entry.normalized_name})),
+        None,
+    )
+    display_name = matched_entry.name if matched_entry else name
+    raw_emails: set[str] = set()
+    primary = payload.get("emailAddress")
+    if isinstance(primary, dict):
+        raw_emails.update(decode_visible_emails(clean_text(primary.get("address"))))
+    alternatives = payload.get("otherEmailAddresses")
+    if isinstance(alternatives, list):
+        for item in alternatives:
+            if isinstance(item, dict):
+                raw_emails.update(decode_visible_emails(clean_text(item.get("address"))))
+
+    contacts: list[Contact] = []
+    rejections: list[Rejection] = []
+    for email in sorted(raw_emails):
+        ok, reason = classify_email(email, institution.host)
+        if ok:
+            contacts.append(Contact(display_name, email, institution.name, profile_url, "Official public profile API", 0))
+        elif reason:
+            rejections.append(Rejection(display_name, reason, profile_url, email))
+    if not contacts:
+        rejections.append(Rejection(display_name, "No visible institutional email", profile_url))
     return contacts, rejections
 
 
@@ -1947,6 +2408,19 @@ def crawl_profiles(
         if not related_official_domain(final_url, institution.host):
             continue
         found_contacts, found_rejections = parse_profile_page(final_url, html, institution, roster_entries)
+        if not found_contacts:
+            payload, payload_error = fetch_public_profile_payload(session, final_url, html)
+            if payload:
+                api_contacts, api_rejections = parse_public_profile_payload(
+                    final_url,
+                    payload,
+                    institution,
+                    roster_entries,
+                )
+                found_contacts.extend(api_contacts)
+                found_rejections.extend(api_rejections)
+            elif payload_error:
+                blocked.append(f"{final_url}: {payload_error}")
         contacts.extend(found_contacts)
         rejections.extend(found_rejections)
         log.append(f"{final_url}: {len(found_contacts)} contact(s)")
@@ -1964,31 +2438,33 @@ def extract_card_level_contacts(
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
     pending = [entry for entry in roster_entries if entry.normalized_name not in already_covered]
-    by_page: dict[str, list[FacultyEntry]] = {}
-    for entry in pending:
-        by_page.setdefault(entry.source_url, []).append(entry)
+    wanted = {entry.normalized_name: entry for entry in pending}
+    matched: set[str] = set()
 
-    for page_url, entries in by_page.items():
-        html = page_cache.get(page_url)
-        if not html:
-            continue
+    for page_url, html in page_cache.items():
         soup = BeautifulSoup(html, "html.parser")
-        wanted = {entry.normalized_name: entry for entry in entries}
-        matched: set[str] = set()
-        for node in soup.select(CANDIDATE_NODE_SELECTOR):
+        for node in faculty_candidate_nodes(soup):
             node_name = extract_name_from_node(node)
             if not node_name:
                 continue
             normalized = normalize_person_name(node_name)
             entry = wanted.get(normalized)
+            if not entry:
+                possible_entries = [
+                    candidate
+                    for candidate in pending
+                    if roster_name_match(node_name, {candidate.normalized_name})
+                ]
+                if len(possible_entries) == 1:
+                    entry = possible_entries[0]
+                    normalized = entry.normalized_name
             if not entry or normalized in matched:
                 continue
             block_text = clean_text(node.get_text(" ", strip=True))
             if is_admin_context(block_text):
                 continue
-            if len(collect_names_in_node(node)) != 1:
+            if len(collect_names_in_node(node)) != 1 and node.name not in {"article", "tr"}:
                 continue
-            matched.add(normalized)
             emails = emails_in_local_block(node, block_text)
             valid_found = False
             for email in sorted(emails):
@@ -2000,9 +2476,11 @@ def extract_card_level_contacts(
                     rejections.append(Rejection(entry.name, reason, page_url, email))
             if not valid_found:
                 rejections.append(Rejection(entry.name, "No visible institutional email", page_url))
-        for entry in entries:
-            if entry.normalized_name not in matched:
-                rejections.append(Rejection(entry.name, "No precise local card match", page_url))
+            else:
+                matched.add(normalized)
+    for entry in pending:
+        if entry.normalized_name not in matched:
+            rejections.append(Rejection(entry.name, "No precise local card match", entry.source_url))
     return contacts, rejections
 
 
@@ -2011,45 +2489,57 @@ def extract_pdf_contacts(
     institution: Institution,
     terms: list[str],
 ) -> tuple[list[Contact], list[Rejection]]:
-    session = make_session()
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
-    for page in department_pages:
-        if not is_pdf_url(page.url):
-            continue
-        text, error = fetch_pdf_text(session, page.url)
-        if error or not text or not text_matches_terms(text, terms):
-            continue
-        chunks = re.split(r"\n|(?<=\.)\s{2,}", text)
-        for chunk in chunks:
-            cleaned = clean_text(chunk)
-            if not (8 <= len(cleaned) <= 500):
+    pdf_pages = [page for page in department_pages if is_pdf_url(page.url)]
+
+    def fetch_document(page: PageCandidate) -> tuple[PageCandidate, str | None, str | None]:
+        document_session = make_session()
+        text, error = fetch_pdf_text(document_session, page.url)
+        return page, text, error
+
+    with ThreadPoolExecutor(max_workers=min(4, len(pdf_pages) or 1)) as executor:
+        documents = executor.map(fetch_document, pdf_pages)
+        for page, text, error in documents:
+            if error or not text or not text_matches_terms(text, terms):
                 continue
-            emails = decode_visible_emails(cleaned)
-            if not emails:
-                continue
-            possible_name = None
-            for candidate in re.findall(r"\b[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){1,4}\b", cleaned):
-                if valid_name(candidate):
-                    possible_name = clean_name(candidate)
-                    break
-            if not possible_name:
-                continue
-            title_text = cleaned[:240]
-            reason = excluded_role_reason(title_text)
-            allowed = matched_allowed_title(title_text)
-            if reason or not allowed:
-                rejections.append(Rejection(possible_name, reason or "No current faculty title", page.url, cleaned[:180]))
-                continue
-            if is_admin_context(cleaned):
-                rejections.append(Rejection(possible_name, "Administrative context", page.url, cleaned[:180]))
-                continue
-            for email in emails:
-                ok, email_reason = classify_email(email, institution.host)
-                if ok:
-                    contacts.append(Contact(possible_name, email, institution.name, page.url, "Official PDF", 2))
-                elif email_reason:
-                    rejections.append(Rejection(possible_name, email_reason, page.url, email))
+            lines = [clean_text(line) for line in text.splitlines() if clean_text(line)]
+            for index, line in enumerate(lines):
+                emails = decode_visible_emails(line)
+                if not emails:
+                    continue
+                name = None
+                name_index = None
+                for candidate_index in range(index, max(-1, index - 9), -1):
+                    candidate_line = lines[candidate_index]
+                    if "@" in candidate_line or ":" in candidate_line:
+                        continue
+                    candidate = clean_name(candidate_line)
+                    if valid_name(candidate):
+                        name = candidate
+                        name_index = candidate_index
+                        break
+                if not name or name_index is None:
+                    continue
+                context = clean_text(" ".join(lines[name_index:index + 1]))
+                if len(context) > 900:
+                    continue
+                if not text_matches_terms(context, terms):
+                    continue
+                reason = excluded_role_reason(context)
+                allowed = matched_allowed_title(context)
+                if reason or not allowed:
+                    rejections.append(Rejection(name, reason or "No current faculty title", page.url, context[:180]))
+                    continue
+                if is_admin_context(context):
+                    rejections.append(Rejection(name, "Administrative context", page.url, context[:180]))
+                    continue
+                for email in emails:
+                    ok, email_reason = classify_email(email, institution.host)
+                    if ok:
+                        contacts.append(Contact(name, email, institution.name, page.url, "Official PDF", 2))
+                    elif email_reason:
+                        rejections.append(Rejection(name, email_reason, page.url, email))
     return contacts, rejections
 
 
@@ -2060,6 +2550,9 @@ def process_institution(
     specialty: str,
     custom_keywords: str,
     delay_seconds: float,
+    country_code: str = "",
+    region_code: str = "",
+    region_kind: str = "Region",
 ) -> tuple[list[Contact], InstitutionReport]:
     terms = resolve_terms(specialty, custom_keywords)
     session = make_session()
@@ -2091,13 +2584,33 @@ def process_institution(
         disallowed_paths=disallowed_paths,
         seed_cache=seed_cache,
     )
+    unfiltered_roster_count = len(roster_entries)
+    roster_entries = filter_roster_to_location(
+        roster_entries,
+        country_code,
+        region,
+        region_code,
+        region_kind,
+    )
+    if len(roster_entries) != unfiltered_roster_count:
+        report.notes.append(
+            f"Location-labeled roster filtered from {unfiltered_roster_count} to {len(roster_entries)} entries."
+        )
     report.faculty_roster_entries = len(roster_entries)
     report.pages_checked = len(crawl_log)
     report.blocked_or_unreadable.extend(blocked)
     report.rejections.extend(role_rejections)
     report.notes.extend(crawl_log[:8])
 
+    pdf_contacts, pdf_rejections = extract_pdf_contacts(department_pages, institution, terms)
+    report.rejections.extend(pdf_rejections)
+
     if not roster_entries:
+        pdf_contacts = deduplicate_contacts(pdf_contacts)
+        if pdf_contacts:
+            report.contacts_found = len(pdf_contacts)
+            report.status = "Verified contacts found"
+            return pdf_contacts, report
         if any("JavaScript-only" in line for line in crawl_log):
             report.status = "JavaScript-only directory"
         elif blocked and not crawl_log:
@@ -2121,9 +2634,7 @@ def process_institution(
 
     covered_names = {normalize_person_name(contact.name) for contact in profile_contacts}
     card_contacts, card_rejections = extract_card_level_contacts(roster_entries, institution, page_cache, covered_names)
-    pdf_contacts, pdf_rejections = extract_pdf_contacts(department_pages, institution, terms)
     report.rejections.extend(card_rejections)
-    report.rejections.extend(pdf_rejections)
 
     personal_contacts = deduplicate_contacts(profile_contacts + card_contacts + pdf_contacts)
     if personal_contacts:
@@ -2157,6 +2668,10 @@ st.markdown(
         border-radius: 8px;
         padding: 0.65rem 0.8rem;
         background: #fbfcff;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"],
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: #101828;
     }
     .small-note { color: #667085; font-size: 0.92rem; line-height: 1.45; }
     </style>
@@ -2307,6 +2822,9 @@ if institutions:
                 specialty=specialty,
                 custom_keywords=custom_keywords,
                 delay_seconds=delay_seconds,
+                country_code=country_code,
+                region_code=region_code,
+                region_kind=region_kind,
             )
             all_contacts.extend(contacts)
             reports.append(report)
