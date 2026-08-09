@@ -30,13 +30,21 @@ The app never guesses, generates, constructs, infers, or predicts emails from na
 
 ## No-Public-Email Fallback
 
-If an institution publishes faculty names but no verified personal faculty emails, the app can return exactly one generic department contact such as:
+If no verified personal faculty email is available, the app first returns one publicly
+published generic contact for the verified department, such as:
 
 ```text
 Department Contact,nursing@university.edu
 ```
 
-This happens only when the department is verified and the generic address appears on an official department or university page.
+If no suitable department address is published, it returns one best-fit official
+institutional contact for a medical conference invitation. Faculty affairs, academic
+affairs, medical education, continuing medical education, events, outreach, and
+communications addresses are preferred over a general information address. Admissions,
+webmaster, support, billing, privacy, careers, and HR addresses are rejected as poor fits.
+
+Every fallback address must be visibly published on an official or affiliated
+institutional page. The app never invents or predicts a fallback email.
 
 ## Run Locally
 
@@ -77,6 +85,10 @@ Try:
 Then click **Discover Institutions**, select one or more institutions, and click **Search Selected Institutions**.
 
 Institution discovery verifies the root website brand, academic or teaching-health identity, selected location, and selected-specialty evidence before showing a result. Page headlines, job listings, directory sites, default server pages, and out-of-location institutions are rejected.
+
+The institution search uses a live activity feed tied to actual crawler stages. Completed
+institutions remain visible, the current and next institutions are identified, and the
+percentage bar is kept as a secondary indicator.
 
 The crawler does not cap the number of institutions, department pages, faculty pages, profiles, pagination links, sitemap entries, or PDF pages it processes. Broad searches can therefore take longer. The request-delay control remains available to keep crawling polite.
 
