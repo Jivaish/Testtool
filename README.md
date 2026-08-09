@@ -2,7 +2,10 @@
 
 A ready-to-deploy Streamlit app for finding publicly visible official faculty work emails from universities, colleges, medical schools, teaching hospitals, health-science institutions, and academic centres.
 
-The app uses web search plus direct official-site crawling. It does not use paid APIs, AI APIs, login-only data, third-party people databases, or guessed email patterns.
+The app searches for answer-bearing official pages first, verifies the institution and
+selected location from that evidence, and then follows only relevant official program,
+department, directory, and profile pages. It does not use paid APIs, AI APIs, login-only
+data, third-party people databases, or guessed email patterns.
 
 Country selection uses the full ISO country list. The location dropdown combines official country subdivisions with searchable city data, and includes an all-regions option.
 
@@ -22,8 +25,9 @@ Accuracy is prioritized over quantity. A contact is returned only when:
 
 - the person is associated with the selected department or a directly related academic unit,
 - the person appears to be current faculty, academic teaching staff, or an eligible academic researcher,
-- the email is visibly published on an official institutional source,
-- the email is an official institutional work email,
+- the email is visibly published on an official institutional teaching source,
+- the email is an institutional work email, or a professional affiliate email explicitly
+  published beside the faculty member on that verified teaching source,
 - the name and email are locally associated on a profile, card, directory row, official PDF, or similar source.
 
 The app never guesses, generates, constructs, infers, or predicts emails from names.
@@ -84,7 +88,12 @@ Try:
 
 Then click **Discover Institutions**, select one or more institutions, and click **Search Selected Institutions**.
 
-Institution discovery verifies the root website brand, academic or teaching-health identity, selected location, and selected-specialty evidence before showing a result. Page headlines, job listings, directory sites, default server pages, and out-of-location institutions are rejected.
+Institution discovery verifies the root website brand, academic or teaching-health
+identity, selected location, and selected-specialty evidence before showing a result.
+Regional medical-school pathways and official clerkship or clinical-site pages count as
+evidence for both the local teaching institution and its partner medical school. Page
+headlines, job listings, directory sites, default server pages, and out-of-location
+institutions are rejected.
 
 The institution search uses a live activity feed tied to actual crawler stages. Completed
 institutions remain visible, the current and next institutions are identified, and the
