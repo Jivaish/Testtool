@@ -46,6 +46,7 @@ except Exception:  # pragma: no cover - PDF extraction is optional at runtime
 # ==================================================
 
 APP_NAME = "Global Medical Faculty Contact Finder"
+DEFAULT_REQUEST_DELAY = 0.45
 USER_AGENT = (
     "Mozilla/5.0 (compatible; GlobalMedicalFacultyContactFinder/1.0; "
     "+https://streamlit.io)"
@@ -76,6 +77,11 @@ BAD_SOURCE_HOST_MARKERS = (
     "collegesimply.", "petersons.", "study.com", "degreesearch.",
     "ama-assn.", "residencyexplorer.", "residencyprogramslist.",
     "matcharesident.", "freida.", "medresidency.",
+    "edurank.", "residencyadvisor.", "residencyprograms.io",
+    "residentswap.", "programdirectory.", "yellowpages.", "medifind.",
+    "clinicslist.", "academia.edu", "journals.lww.", "tools.apgo.",
+    "masters-in-health-administration.", "medschoolinsiders.",
+    "universitysupplystore.", "twstalker.",
 )
 
 INSTITUTION_WORDS = (
@@ -732,31 +738,91 @@ def search_region_for_country(country_code: str = "") -> str:
     return DDGS_REGION_BY_COUNTRY.get((country_code or "").upper(), "wt-wt")
 
 
-def ddg_search(query: str, search_region: str = "wt-wt") -> list[dict[str, str]]:
-    if DDGS is None:
+@dataclass(frozen=True)
+class PlannedSearch:
+    query: str
+    phase: str
+    intent: str
+
+
+class SearchProvider:
+    name = "search-provider"
+
+    def search(self, query: str, search_region: str = "wt-wt") -> list[dict[str, str]]:
+        raise NotImplementedError
+
+
+class DDGSSearchProvider(SearchProvider):
+    name = "ddgs-auto"
+
+    def search(self, query: str, search_region: str = "wt-wt") -> list[dict[str, str]]:
+        if DDGS is None:
+            return []
+        for attempt in range(2):
+            results: list[dict[str, str]] = []
+            try:
+                with DDGS(timeout=8) as ddgs:
+                    for item in ddgs.text(
+                        query,
+                        region=search_region or "wt-wt",
+                        backend="auto",
+                        max_results=None,
+                    ):
+                        href = item.get("href") or item.get("url") or ""
+                        title = item.get("title") or ""
+                        body = item.get("body") or item.get("snippet") or ""
+                        if href:
+                            results.append(
+                                {
+                                    "url": href,
+                                    "title": title,
+                                    "body": body,
+                                    "query": query,
+                                    "provider": self.name,
+                                }
+                            )
+            except Exception:
+                results = []
+            if results:
+                return results
+            if attempt == 0:
+                time.sleep(0.4)
         return []
-    for attempt in range(2):
-        results: list[dict[str, str]] = []
-        try:
-            with DDGS(timeout=8) as ddgs:
-                for item in ddgs.text(
-                    query,
-                    region=search_region or "wt-wt",
-                    backend="auto",
-                    max_results=None,
-                ):
-                    href = item.get("href") or item.get("url") or ""
-                    title = item.get("title") or ""
-                    body = item.get("body") or item.get("snippet") or ""
-                    if href:
-                        results.append({"url": href, "title": title, "body": body, "query": query})
-        except Exception:
-            results = []
-        if results:
-            return results
-        if attempt == 0:
-            time.sleep(0.4)
-    return []
+
+
+DEFAULT_SEARCH_PROVIDER = DDGSSearchProvider()
+
+
+def search_web(
+    query: str,
+    search_region: str = "wt-wt",
+    provider: SearchProvider | None = None,
+) -> list[dict[str, str]]:
+    return (provider or DEFAULT_SEARCH_PROVIDER).search(query, search_region)
+
+
+def ddg_search(query: str, search_region: str = "wt-wt") -> list[dict[str, str]]:
+    """Backward-compatible entry point used by existing integrations and tests."""
+    return search_web(query, search_region, DEFAULT_SEARCH_PROVIDER)
+
+
+def execute_search_round(
+    searches: list[PlannedSearch],
+    search_region: str,
+    provider: SearchProvider | None = None,
+) -> list[tuple[PlannedSearch, list[dict[str, str]]]]:
+    if not searches:
+        return []
+
+    def run(search: PlannedSearch) -> tuple[PlannedSearch, list[dict[str, str]]]:
+        results = search_web(search.query, search_region, provider)
+        for result in results:
+            result["search_phase"] = search.phase
+            result["search_intent"] = search.intent
+        return search, results
+
+    with ThreadPoolExecutor(max_workers=min(8, len(searches))) as executor:
+        return list(executor.map(run, searches))
 
 
 def domain_hints_for_country(country: str, country_code: str = "") -> list[str]:
@@ -769,13 +835,13 @@ def domain_hints_for_country(country: str, country_code: str = "") -> list[str]:
     return [hint for hint in hints if not (hint in seen or seen.add(hint))]
 
 
-def build_institution_queries(
+def build_institution_query_plan(
     country: str,
     country_code: str,
     region: str,
     specialty: str,
     terms: list[str],
-) -> list[str]:
+) -> list[PlannedSearch]:
     location = region or country
     primary_term = terms[0] if terms else specialty
     core_terms = [primary_term]
@@ -783,35 +849,60 @@ def build_institution_queries(
     core_terms = list(dict.fromkeys(term for term in core_terms if term))
     term_query = " OR ".join(f'"{term}"' for term in core_terms)
     location_query = f'"{location}"'
-    queries = [
-        f'{location_query} university official website -jobs -news',
-        f'{location_query} medical school official website -jobs -news',
-        f'{location_query} osteopathic medical college official',
-        f'{location_query} osteopathic medical campus official',
-        f'{location_query} health sciences university official website',
-        f'{location_query} academic teaching hospital official website',
-        f'{location_query} ({term_query}) faculty university official',
-        f'{location_query} ({term_query}) medical school faculty',
-        f'{location_query} ({term_query}) college faculty directory',
-        f'{location_query} "{specialty}" academic department faculty',
-        f'{location_query} ({term_query}) university program curriculum',
-        f'{location_query} ({term_query}) medical education clinical training',
-        f'{location_query} ({term_query}) clerkship clinical rotation university',
-        f'{location_query} "{specialty}" required clerkship medical school curriculum',
-        f'{location_query} "{specialty}" clinical curriculum faculty contact',
-        f'{location_query} ({term_query}) medical students site information',
-        f'{location_query} ({term_query}) medical school partnership pathway',
-        f'{location_query} ({term_query}) residency fellowship academic',
-        f'{location_query} ({term_query}) regional campus teaching site',
+    searches = [
+        PlannedSearch(f'{location_query} university official website -jobs -news', "explore", "university_identity"),
+        PlannedSearch(f'{location_query} medical school official website -jobs -news', "explore", "medical_school_identity"),
+        PlannedSearch(f'{location_query} osteopathic medical college official', "explore", "osteopathic_identity"),
+        PlannedSearch(f'{location_query} osteopathic medical campus official', "explore", "osteopathic_campus"),
+        PlannedSearch(f'{location_query} health sciences university official website', "explore", "health_sciences_identity"),
+        PlannedSearch(f'{location_query} academic teaching hospital official website', "explore", "teaching_institution_identity"),
+        PlannedSearch(f'{location_query} ({term_query}) faculty university official', "specialty", "faculty"),
+        PlannedSearch(f'{location_query} ({term_query}) medical school faculty', "specialty", "medical_faculty"),
+        PlannedSearch(f'{location_query} ({term_query}) college faculty directory', "specialty", "faculty_directory"),
+        PlannedSearch(f'{location_query} "{specialty}" academic department faculty', "specialty", "academic_department"),
+        PlannedSearch(f'{location_query} ({term_query}) university program curriculum', "specialty", "curriculum"),
+        PlannedSearch(f'{location_query} ({term_query}) medical education clinical training', "specialty", "clinical_training"),
+        PlannedSearch(f'{location_query} ({term_query}) clerkship clinical rotation university', "coverage", "clerkship"),
+        PlannedSearch(
+            f'{location_query} "{specialty}" required clerkship medical school curriculum',
+            "coverage",
+            "required_clerkship",
+        ),
+        PlannedSearch(f'{location_query} "{specialty}" clinical curriculum faculty contact', "coverage", "faculty_contact"),
+        PlannedSearch(f'{location_query} ({term_query}) medical students site information', "coverage", "medical_students"),
+        PlannedSearch(f'{location_query} ({term_query}) medical school partnership pathway', "coverage", "partnership"),
+        PlannedSearch(f'{location_query} ({term_query}) residency fellowship academic', "coverage", "academic_training"),
+        PlannedSearch(f'{location_query} ({term_query}) regional campus teaching site', "coverage", "regional_teaching"),
     ]
     for hint in domain_hints_for_country(country, country_code):
-        queries.extend([
-            f'site:{hint} "{region or country}" ({term_query}) faculty',
-            f'site:{hint} "{region or country}" "{specialty}" department',
-            f'site:{hint} "{region or country}" "{specialty}" curriculum clerkship',
+        searches.extend([
+            PlannedSearch(f'site:{hint} "{region or country}" ({term_query}) faculty', "coverage", "country_domain_faculty"),
+            PlannedSearch(
+                f'site:{hint} "{region or country}" "{specialty}" department',
+                "coverage",
+                "country_domain_department",
+            ),
+            PlannedSearch(
+                f'site:{hint} "{region or country}" "{specialty}" curriculum clerkship',
+                "coverage",
+                "country_domain_curriculum",
+            ),
         ])
     seen: set[str] = set()
-    return [q for q in queries if not (q in seen or seen.add(q))]
+    return [search for search in searches if not (search.query in seen or seen.add(search.query))]
+
+
+def build_institution_queries(
+    country: str,
+    country_code: str,
+    region: str,
+    specialty: str,
+    terms: list[str],
+) -> list[str]:
+    return [
+        search.query
+        for search in build_institution_query_plan(country, country_code, region, specialty, terms)
+    ]
 
 
 def is_academic_domain(host: str) -> bool:
@@ -829,6 +920,7 @@ def score_institution_result(
     country: str,
     country_code: str,
     terms: list[str],
+    location: str = "",
 ) -> int:
     host = host_of(url)
     if not host or is_bad_external_source(url):
@@ -843,7 +935,11 @@ def score_institution_result(
     elif any(word in combined for word in INSTITUTION_WORDS):
         score += 10
     if any(fold_text(term) in combined for term in terms):
-        score += 4
+        score += 10
+    if location and contains_location_term(combined, location):
+        score += 12
+    if any(word in combined for word in ("faculty", "curriculum", "clerkship", "clinical training")):
+        score += 8
     for hint in domain_hints_for_country(country, country_code):
         if host.endswith(hint.lstrip(".")) or hint in host:
             score += 12
@@ -858,6 +954,47 @@ def score_institution_result(
     if any(bad in combined for bad in ("ranking", "wikipedia", "linkedin", "facebook", "directory listing")):
         score -= 50
     return score
+
+
+def institution_result_signals(
+    url: str,
+    title: str,
+    body: str,
+    location: str,
+    terms: list[str],
+) -> set[str]:
+    combined = fold_text(f"{url} {title} {body}")
+    signals: set[str] = set()
+    if is_academic_domain(host_of(url)) or any(word in combined for word in STRONG_INSTITUTION_WORDS):
+        signals.add("academic")
+    if any(fold_text(term) in combined for term in terms):
+        signals.add("specialty")
+    if not location or contains_location_term(combined, location):
+        signals.add("location")
+    if any(word in combined for word in ("faculty", "people", "directory", "professor")):
+        signals.add("faculty")
+    if any(
+        word in combined
+        for word in (
+            "curriculum", "clerkship", "clinical rotation", "clinical training",
+            "medical education", "teaching", "residency", "fellowship",
+        )
+    ):
+        signals.add("teaching")
+    if "official" in combined or is_academic_domain(host_of(url)):
+        signals.add("official")
+    return signals
+
+
+def promising_institution_root(root: str) -> bool:
+    folded = fold_text(root)
+    return is_academic_domain(root) or any(
+        marker in folded
+        for marker in (
+            "university", "college", "school", "medical", "medicine",
+            "health", "hospital", "institute", "academy",
+        )
+    )
 
 
 def clean_institution_name_candidate(value: str) -> str:
@@ -1296,124 +1433,203 @@ def discover_institutions(
     custom_keywords: str,
 ) -> tuple[list[Institution], list[str]]:
     discovery_terms = resolve_discovery_terms(specialty, custom_keywords)
-    queries = build_institution_queries(country, country_code, region, specialty, discovery_terms)
+    query_plan = build_institution_query_plan(
+        country,
+        country_code,
+        region,
+        specialty,
+        discovery_terms,
+    )
     institutions_by_root: dict[str, Institution] = {}
     candidates_by_root: dict[str, dict[str, tuple[int, str, dict[str, str]]]] = {}
     log: list[str] = []
     search_region = search_region_for_country(country_code)
+    executed_queries: set[str] = set()
+    refined_roots: dict[str, set[str]] = {"faculty": set(), "curriculum": set()}
 
-    with ThreadPoolExecutor(max_workers=min(6, len(queries))) as executor:
-        search_groups = list(executor.map(lambda query: ddg_search(query, search_region), queries))
+    def add_search_result(
+        search: PlannedSearch,
+        result: dict[str, str],
+        target_root: str = "",
+    ) -> bool:
+        normalized_result_url = normalize_url(result["url"])
+        if not normalized_result_url:
+            return False
+        if target_root and not related_official_domain(normalized_result_url, target_root):
+            return False
 
-    for query, search_results in zip(queries, search_groups):
-        log.append(f"{query}: {len(search_results)} result(s)")
-        for result in search_results:
-            candidate_url = canonical_institution_url(result["url"])
-            if not candidate_url:
-                continue
-            host = host_of(candidate_url)
-            root = institution_candidate_host(host)
-            score = score_institution_result(
-                result["url"],
-                result["title"],
-                result["body"],
-                country,
-                country_code,
-                discovery_terms,
-            )
-            if score < 35:
-                continue
-            result_text = fold_text(f"{result['url']} {result['title']} {result['body']}")
-            has_specialty_evidence = any(fold_text(term) in result_text for term in discovery_terms)
-            has_region_evidence = contains_location_term(result_text, region) if region else True
-            enriched_result = {
-                **result,
-                "candidate_url": candidate_url,
-                "specialty_evidence": "1" if has_specialty_evidence else "0",
-                "region_evidence": "1" if has_region_evidence else "0",
-            }
-            root_candidates = candidates_by_root.setdefault(root, {})
-            evidence_key = normalize_url(result["url"]) or result["url"]
-            existing_candidate = root_candidates.get(evidence_key)
-            new_rank = (
-                int(has_specialty_evidence),
-                int(has_specialty_evidence and has_region_evidence),
-                score,
-            )
-            existing_rank = (
-                int(bool(existing_candidate and existing_candidate[2]["specialty_evidence"] == "1")),
-                int(bool(
-                    existing_candidate
-                    and existing_candidate[2]["specialty_evidence"] == "1"
-                    and existing_candidate[2].get("region_evidence") == "1"
-                )),
-                existing_candidate[0] if existing_candidate else -1000,
-            )
-            if not existing_candidate or new_rank > existing_rank:
-                root_candidates[evidence_key] = (score, query, enriched_result)
+        candidate_url = canonical_institution_url(result["url"])
+        if target_root:
+            existing_payloads = candidates_by_root.get(target_root, {})
+            if not existing_payloads:
+                return False
+            candidate_url = max(
+                existing_payloads.values(),
+                key=lambda payload: payload[0],
+            )[2]["candidate_url"]
+        if not candidate_url:
+            return False
+        root = target_root or institution_candidate_host(host_of(candidate_url))
+        signals = institution_result_signals(
+            result["url"],
+            result["title"],
+            result["body"],
+            region or country,
+            discovery_terms,
+        )
+        score = score_institution_result(
+            result["url"],
+            result["title"],
+            result["body"],
+            country,
+            country_code,
+            discovery_terms,
+            region or country,
+        )
+        if score < 35:
+            return False
+        has_specialty_evidence = "specialty" in signals
+        has_region_evidence = "location" in signals
+        if target_root and any(
+            payload[2].get("region_evidence") == "1"
+            for payload in candidates_by_root[target_root].values()
+        ):
+            has_region_evidence = True
+        enriched_result = {
+            **result,
+            "candidate_url": candidate_url,
+            "specialty_evidence": "1" if has_specialty_evidence else "0",
+            "region_evidence": "1" if has_region_evidence else "0",
+            "evidence_signals": ",".join(sorted(signals)),
+            "search_phase": search.phase,
+            "search_intent": search.intent,
+        }
+        was_new_root = root not in candidates_by_root
+        root_candidates = candidates_by_root.setdefault(root, {})
+        evidence_key = normalized_result_url
+        existing_candidate = root_candidates.get(evidence_key)
+        new_rank = (
+            int(has_specialty_evidence),
+            int(has_specialty_evidence and has_region_evidence),
+            len(signals),
+            score,
+        )
+        existing_rank = (
+            int(bool(existing_candidate and existing_candidate[2]["specialty_evidence"] == "1")),
+            int(bool(
+                existing_candidate
+                and existing_candidate[2]["specialty_evidence"] == "1"
+                and existing_candidate[2].get("region_evidence") == "1"
+            )),
+            len(existing_candidate[2].get("evidence_signals", "").split(",")) if existing_candidate else 0,
+            existing_candidate[0] if existing_candidate else -1000,
+        )
+        if not existing_candidate or new_rank > existing_rank:
+            root_candidates[evidence_key] = (score, search.query, enriched_result)
+        return was_new_root
 
     term_query = " OR ".join(f'"{term}"' for term in discovery_terms)
-    follow_up_targets = [
-        (root, payloads)
-        for root, payloads in candidates_by_root.items()
-        if payloads
-        and not any(payload[2]["specialty_evidence"] == "1" for payload in payloads.values())
-        and max(payload[0] for payload in payloads.values()) >= 45
-        and any(payload[2].get("region_evidence") == "1" for payload in payloads.values())
-        and is_academic_domain(root)
+
+    def collect_round(
+        searches: list[PlannedSearch],
+        targets_by_query: dict[str, str] | None = None,
+    ) -> set[str]:
+        pending = [search for search in searches if search.query not in executed_queries]
+        for search in pending:
+            executed_queries.add(search.query)
+        new_roots: set[str] = set()
+        for search, results in execute_search_round(pending, search_region):
+            accepted = 0
+            target_root = (targets_by_query or {}).get(search.query, "")
+            for result in results:
+                if add_search_result(search, result, target_root):
+                    new_roots.add(target_root or institution_candidate_host(host_of(result["url"])))
+                normalized = normalize_url(result["url"])
+                if normalized:
+                    if target_root:
+                        stored = normalized in candidates_by_root.get(target_root, {})
+                    else:
+                        stored = any(
+                            normalized in payloads
+                            for payloads in candidates_by_root.values()
+                        )
+                    accepted += int(stored)
+            log.append(
+                f"[{search.phase}/{search.intent}] {search.query}: "
+                f"{len(results)} result(s), {accepted} candidate evidence item(s)"
+            )
+        return new_roots
+
+    def evidence_gap_roots() -> list[str]:
+        return [
+            root
+            for root, payloads in candidates_by_root.items()
+            if payloads
+            and not any(payload[2]["specialty_evidence"] == "1" for payload in payloads.values())
+            and max(payload[0] for payload in payloads.values()) >= 45
+            and any(payload[2].get("region_evidence") == "1" for payload in payloads.values())
+            and promising_institution_root(root)
+        ]
+
+    def unresolved_roots(intent: str) -> list[str]:
+        return [
+            root
+            for root in evidence_gap_roots()
+            if root not in refined_roots[intent]
+        ]
+
+    def refine_missing_specialty(intent: str) -> None:
+        roots = unresolved_roots(intent)
+        searches: list[PlannedSearch] = []
+        targets_by_query: dict[str, str] = {}
+        for root in roots:
+            if intent == "faculty":
+                query = f'site:{root} ({term_query}) (department OR faculty OR "faculty directory")'
+            else:
+                query = (
+                    f'site:{root} ({term_query}) '
+                    '(curriculum OR clerkship OR "clinical rotation" OR teaching)'
+                )
+            searches.append(PlannedSearch(query, "refine", intent))
+            targets_by_query[query] = root
+            refined_roots[intent].add(root)
+        if searches:
+            collect_round(searches, targets_by_query)
+
+    initial_searches = [search for search in query_plan if search.phase in {"explore", "specialty"}]
+    collect_round(initial_searches)
+    refine_missing_specialty("faculty")
+    refine_missing_specialty("curriculum")
+
+    core_coverage_intents = {
+        "clerkship", "required_clerkship", "partnership", "regional_teaching",
+        "country_domain_faculty", "country_domain_department", "country_domain_curriculum",
+    }
+    core_coverage = [
+        search
+        for search in query_plan
+        if search.phase == "coverage" and search.intent in core_coverage_intents
     ]
+    collect_round(core_coverage)
+    refine_missing_specialty("faculty")
+    refine_missing_specialty("curriculum")
 
-    def official_specialty_follow_up(
-        target: tuple[str, dict[str, tuple[int, str, dict[str, str]]]],
-    ) -> tuple[str, str, list[dict[str, str]]]:
-        root, _ = target
-        query = (
-            f"site:{root} ({term_query}) "
-            '(faculty OR curriculum OR clerkship OR "clinical rotation")'
-        )
-        return root, query, ddg_search(query, search_region)
-
-    if follow_up_targets:
-        with ThreadPoolExecutor(max_workers=min(12, len(follow_up_targets))) as executor:
-            follow_up_groups = executor.map(official_specialty_follow_up, follow_up_targets)
-            for root, query, results in follow_up_groups:
-                accepted = 0
-                root_candidates = candidates_by_root[root]
-                base_candidate_url = max(
-                    root_candidates.values(),
-                    key=lambda payload: payload[0],
-                )[2]["candidate_url"]
-                for result in results:
-                    normalized_result_url = normalize_url(result["url"])
-                    if not normalized_result_url or not related_official_domain(normalized_result_url, root):
-                        continue
-                    result_text = fold_text(
-                        f"{result['url']} {result['title']} {result['body']}"
-                    )
-                    if not any(fold_text(term) in result_text for term in discovery_terms):
-                        continue
-                    score = score_institution_result(
-                        result["url"],
-                        result["title"],
-                        result["body"],
-                        country,
-                        country_code,
-                        discovery_terms,
-                    )
-                    if score < 35:
-                        continue
-                    evidence_key = normalized_result_url
-                    enriched_result = {
-                        **result,
-                        "candidate_url": base_candidate_url,
-                        "specialty_evidence": "1",
-                        "region_evidence": "1" if contains_location_term(result_text, region) else "0",
-                    }
-                    existing_candidate = root_candidates.get(evidence_key)
-                    if not existing_candidate or score > existing_candidate[0]:
-                        root_candidates[evidence_key] = (score, query, enriched_result)
-                        accepted += 1
-                log.append(f"Official specialty follow-up for {root}: {accepted} evidence result(s)")
+    has_specialty_roots = any(
+        any(payload[2]["specialty_evidence"] == "1" for payload in payloads.values())
+        for payloads in candidates_by_root.values()
+    )
+    remaining_coverage = [
+        search
+        for search in query_plan
+        if search.phase == "coverage" and search.intent not in core_coverage_intents
+    ]
+    remaining_gaps = evidence_gap_roots()
+    if not has_specialty_roots or remaining_gaps:
+        collect_round(remaining_coverage)
+        refine_missing_specialty("faculty")
+        refine_missing_specialty("curriculum")
+    else:
+        log.append("[coverage] Extended searches skipped because evidence gaps converged.")
 
     def verify_candidate(
         grouped_payload: tuple[str, list[tuple[int, str, dict[str, str]]]],
@@ -1626,13 +1842,12 @@ def common_department_paths(official_url: str, terms: list[str]) -> list[str]:
     return sorted(paths)
 
 
-def site_search_department_urls(
+def build_department_query_plan(
     host: str,
     region: str,
     specialty: str,
     terms: list[str],
-    search_region: str = "wt-wt",
-) -> list[dict[str, str]]:
+) -> list[PlannedSearch]:
     primary = terms[0] if terms else specialty
     short_alias = next(
         (
@@ -1643,37 +1858,123 @@ def site_search_department_urls(
         primary,
     )
     email_domain = organization_root(host)
-    queries = [
-        f"site:{host} {primary} faculty",
-        f"site:{host} {specialty} department faculty",
-        f"site:{host} {primary} people directory",
-        f"site:{host} {primary} academic staff",
-        f"site:{host} {region} {primary} faculty",
-        f'site:{host} "{short_alias}" faculty email',
-        f'site:{host} orientation "{short_alias}" faculty',
-        f'site:{host} onboarding "{short_alias}" faculty',
-        f'site:{host} "@{email_domain}" "{short_alias}"',
+    searches = [
+        PlannedSearch(f"site:{host} {primary} faculty", "department", "faculty"),
+        PlannedSearch(
+            f"site:{host} {specialty} department faculty",
+            "department",
+            "academic_department",
+        ),
+        PlannedSearch(f"site:{host} {primary} people directory", "department", "directory"),
+        PlannedSearch(f"site:{host} {primary} academic staff", "department", "academic_staff"),
+        PlannedSearch(f"site:{host} {region} {primary} faculty", "department", "regional_faculty"),
+        PlannedSearch(f'site:{host} "{short_alias}" faculty email', "contact", "faculty_email"),
+        PlannedSearch(
+            f'site:{host} "{specialty}" department contact',
+            "contact",
+            "department_contact",
+        ),
+        PlannedSearch(
+            f'site:{host} "{primary}" program coordinator',
+            "contact",
+            "program_contact",
+        ),
+        PlannedSearch(
+            f'site:{host} "@{email_domain}" "{short_alias}"',
+            "contact",
+            "published_email",
+        ),
+        PlannedSearch(
+            f'site:{host} orientation "{short_alias}" faculty',
+            "documents",
+            "orientation_document",
+        ),
+        PlannedSearch(
+            f'site:{host} onboarding "{short_alias}" faculty',
+            "documents",
+            "onboarding_document",
+        ),
     ]
     document_aliases = [alias for alias in ("ob/gyn", "ob-gyn") if alias in terms and alias != short_alias]
     for alias in document_aliases:
-        queries.extend(
+        searches.extend(
             [
-                f'site:{host} orientation "{alias}" faculty',
-                f'site:{host} "@{email_domain}" "{alias}"',
+                PlannedSearch(
+                    f'site:{host} orientation "{alias}" faculty',
+                    "documents",
+                    "orientation_document",
+                ),
+                PlannedSearch(
+                    f'site:{host} "@{email_domain}" "{alias}"',
+                    "contact",
+                    "published_email",
+                ),
             ]
         )
+    seen: set[str] = set()
+    return [search for search in searches if not (search.query in seen or seen.add(search.query))]
+
+
+def department_search_result_signals(
+    item: dict[str, str],
+    email_domain: str,
+) -> set[str]:
+    source_text = f'{item.get("url", "")} {item.get("title", "")} {item.get("body", "")}'
+    text = fold_text(source_text)
+    signals: set[str] = set()
+    if any(word in text for word in ("faculty", "professor", "directory", "academic staff", "people")):
+        signals.add("faculty")
+    if (
+        f"@{email_domain}" in source_text.casefold()
+        or re.search(r"\b(?:email|contact|coordinator|program office)\b", text)
+    ):
+        signals.add("email")
+    if any(word in text for word in ("orientation", "onboarding", "handbook", "directory pdf")):
+        signals.add("document")
+    if urlparse(item.get("url", "")).path.casefold().endswith((".pdf", ".doc", ".docx")):
+        signals.add("document")
+    return signals
+
+
+def site_search_department_urls(
+    host: str,
+    region: str,
+    specialty: str,
+    terms: list[str],
+    search_region: str = "wt-wt",
+    provider: SearchProvider | None = None,
+) -> list[dict[str, str]]:
+    query_plan = build_department_query_plan(host, region, specialty, terms)
+    email_domain = organization_root(host)
     results: list[dict[str, str]] = []
     seen: set[str] = set()
-    with ThreadPoolExecutor(max_workers=len(queries)) as executor:
-        search_groups = list(executor.map(lambda query: ddg_search(query, search_region), queries))
-    for query, search_results in zip(queries, search_groups):
-        for item in search_results:
-            url = normalize_url(item["url"])
-            if url and url not in seen:
+
+    def collect(searches: list[PlannedSearch]) -> set[str]:
+        round_signals: set[str] = set()
+        for search, search_results in execute_search_round(searches, search_region, provider):
+            for item in search_results:
+                round_signals.update(department_search_result_signals(item, email_domain))
+                url = normalize_url(item.get("url", ""))
+                if not url or url in seen or not related_official_domain(url, host):
+                    continue
+                record = dict(item)
+                record["url"] = url
+                record["query"] = search.query
+                record["search_phase"] = search.phase
+                record["search_intent"] = search.intent
                 seen.add(url)
-                item["url"] = url
-                item["query"] = query
-                results.append(item)
+                results.append(record)
+        return round_signals
+
+    observed_signals = collect(
+        [search for search in query_plan if search.phase == "department"]
+    )
+    if "email" not in observed_signals:
+        observed_signals.update(
+            collect([search for search in query_plan if search.phase == "contact"])
+        )
+    if "document" not in observed_signals and not {"faculty", "email"}.issubset(observed_signals):
+        collect([search for search in query_plan if search.phase == "documents"])
     return results
 
 
@@ -3707,9 +4008,14 @@ def format_elapsed(seconds: float) -> str:
 # 15. Streamlit interface
 # ==================================================
 
-st.set_page_config(page_title=APP_NAME, page_icon="GM", layout="wide")
+st.set_page_config(
+    page_title=APP_NAME,
+    page_icon="GM",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-watermark_path = Path(__file__).parent / "assets" / "aventis-conference-watermark.png"
+watermark_path = Path(__file__).parent / "assets" / "medical-technology-background.png"
 watermark_data = ""
 if watermark_path.exists():
     watermark_data = base64.b64encode(watermark_path.read_bytes()).decode("ascii")
@@ -3717,52 +4023,30 @@ if watermark_path.exists():
 st.markdown(
     f"""
     <style>
+    .stApp {{ background: #071a42; }}
     .stApp::before {{
         content: "";
         position: fixed;
         inset: 0;
         z-index: 0;
         pointer-events: none;
-        background: url("data:image/png;base64,{watermark_data}") right center / cover no-repeat;
-        opacity: 0.055;
-        animation: aventis-watermark-drift 22s ease-in-out infinite alternate;
+        background-image:
+            linear-gradient(rgba(3, 12, 35, 0.42), rgba(3, 12, 35, 0.60)),
+            url("data:image/png;base64,{watermark_data}");
+        background-position: center;
+        background-size: cover;
+        background-repeat: no-repeat;
+        animation: medical-background-drift 24s ease-in-out infinite alternate;
     }}
     .stApp > * {{ position: relative; z-index: 1; }}
-    @keyframes aventis-watermark-drift {{
-        from {{ transform: translate3d(0, 0, 0) scale(1); opacity: 0.045; }}
-        to {{ transform: translate3d(0.8rem, -0.35rem, 0) scale(1.015); opacity: 0.075; }}
+    @keyframes medical-background-drift {{
+        from {{ transform: translate3d(0, 0, 0) scale(1); }}
+        to {{ transform: translate3d(0.6rem, -0.3rem, 0) scale(1.018); }}
     }}
     @media (prefers-reduced-motion: reduce) {{
         .stApp::before {{ animation: none; }}
     }}
     .block-container {{ max-width: 1180px; padding-top: 1.5rem; }}
-    .aventis-brand {{
-        display: flex;
-        align-items: center;
-        gap: 0.7rem;
-        margin-bottom: 1.1rem;
-        color: #dbeafe;
-        letter-spacing: 0;
-    }}
-    .aventis-monogram {{
-        display: grid;
-        place-items: center;
-        width: 2.4rem;
-        height: 2.4rem;
-        color: #ffffff;
-        background: #0877b9;
-        border-left: 0.3rem solid #57c66c;
-        border-radius: 6px;
-        font-size: 1.45rem;
-        font-weight: 800;
-    }}
-    .aventis-wordmark {{ font-size: 1rem; font-weight: 700; line-height: 1.05; }}
-    .aventis-wordmark small {{
-        display: block;
-        color: #74c9ee;
-        font-size: 0.66rem;
-        margin-top: 0.22rem;
-    }}
     button[data-testid="stBaseButton-primary"] {{
         background: #0877b9;
         border-color: #0877b9;
@@ -3785,17 +4069,10 @@ st.markdown(
     .small-note {{ color: #9ba7ba; font-size: 0.92rem; line-height: 1.45; }}
     @media (max-width: 640px) {{
         .block-container {{ padding-top: 3.75rem; }}
-        .aventis-brand {{ margin-bottom: 0.8rem; }}
-        .stApp::before {{ background-position: 72% center; opacity: 0.04; }}
+        .stApp::before {{ background-position: 46% center; }}
     }}
     </style>
     """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    '<div class="aventis-brand"><span class="aventis-monogram">A</span>'
-    '<span class="aventis-wordmark">AVENTIS<small>CONFERENCES</small></span></div>',
     unsafe_allow_html=True,
 )
 st.title(APP_NAME)
@@ -3805,10 +4082,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.subheader("Request settings")
-    delay_seconds = st.slider("Delay between requests", 0.1, 2.0, 0.45, 0.05)
-    st.caption("All qualifying institutions, pages, and profiles are processed. Larger searches can take longer.")
+delay_seconds = DEFAULT_REQUEST_DELAY
 
 if "institutions" not in st.session_state:
     st.session_state.institutions = []

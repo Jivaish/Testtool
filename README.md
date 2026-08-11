@@ -7,10 +7,17 @@ selected location from that evidence, and then follows only relevant official pr
 department, directory, and profile pages. It does not use paid APIs, AI APIs, login-only
 data, third-party people databases, or guessed email patterns.
 
-Public web discovery uses localized search regions when available and a global search
-region everywhere else. Multiple institution, specialty, curriculum, clerkship, faculty,
-and department query formulations are searched without a result-count cap. Candidates
-must then pass official-site brand, location, and specialty-evidence checks.
+Public web discovery uses a pluggable search-provider layer backed by DDGS in automatic
+backend mode. It uses localized search regions when available and a global search region
+everywhere else. No paid AI or Google API is required.
+
+The deterministic query planner works in evidence-driven rounds. It first explores
+institution identities and specialty matches, then searches unresolved official domains
+for faculty, department, curriculum, clerkship, clinical-training, contact, and document
+evidence. Extended searches stop only when the current evidence gaps have converged;
+there is no result-count cap. Candidates must then pass official-site brand, location,
+and specialty-evidence checks. Search snippets help discovery but never serve as the
+final authority for an institution or contact.
 
 Institution results are canonicalized by verified organization identity, so multiple
 subdomains and alternate result titles do not create repeated institutions. Generic
@@ -85,7 +92,7 @@ source .venv/bin/activate
    - `requirements.txt`
    - `README.md`
    - `.gitignore`
-   - `assets/aventis-conference-watermark.png`
+   - `assets/medical-technology-background.png`
 3. Go to Streamlit Community Cloud.
 4. Select the repository.
 5. Set the main file path to `app.py`.
@@ -112,11 +119,15 @@ The institution search uses a live activity feed tied to actual crawler stages. 
 institutions remain visible, the current and next institutions are identified, and the
 percentage bar is kept as a secondary indicator.
 
-The interface uses a responsive Aventis-inspired masthead and a subtle animated medical
-conference watermark. Motion is disabled automatically for users who prefer reduced
-motion.
+The interface uses the supplied medical-technology artwork as a responsive full-page
+background with subtle movement. Motion is disabled automatically for users who prefer
+reduced motion. Request throttling remains enabled internally without occupying a
+permanent settings sidebar.
 
-The crawler does not cap the number of institutions, department pages, faculty pages, profiles, pagination links, sitemap entries, or PDF pages it processes. Broad searches can therefore take longer. The request-delay control remains available to keep crawling polite.
+The crawler does not cap the number of institutions, department pages, faculty pages,
+profiles, pagination links, sitemap entries, or PDF pages it processes. Broad searches
+can therefore take longer. A small internal request delay keeps crawling polite without
+placing artificial crawl limits in the interface.
 
 ## Known Limitations
 
