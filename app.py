@@ -913,6 +913,18 @@ def institution_related_domain(url_or_host: str, institution: Institution) -> bo
     )
 
 
+def institution_search_hosts(institution: Institution) -> list[str]:
+    """Return verified hosts plus their parent institutional domains for web search."""
+    seen: set[str] = set()
+    hosts: list[str] = []
+    for host in institution_hosts(institution):
+        parent = organization_root(host)
+        for candidate in (host, parent):
+            if candidate and not (candidate in seen or seen.add(candidate)):
+                hosts.append(candidate)
+    return hosts
+
+
 def is_bad_external_source(url: str) -> bool:
     host = host_of(url)
     return any(marker in host for marker in BAD_SOURCE_HOST_MARKERS)
@@ -2633,15 +2645,16 @@ def discover_second_pass_pages(
     existing_urls: Iterable[str],
     disallowed_paths: list[str],
     country_code: str = "",
+    compact: bool = False,
 ) -> tuple[list[PageCandidate], dict[str, str], list[str]]:
     searches = [
         search
-        for host_index, host in enumerate(institution_hosts(institution))
+        for host_index, host in enumerate(institution_search_hosts(institution))
         for search in build_faculty_audit_query_plan(
             host,
             specialty,
             terms,
-            compact=host_index > 0,
+            compact=compact or host_index > 0,
         )
     ]
     existing = {normalize_url(url) for url in existing_urls}
@@ -2697,10 +2710,56 @@ def discover_second_pass_pages(
         matched = text_matches_terms(f"{url} {title} {text[:4000]}", terms)
         if not matched:
             return None, "", f"Rejected {url}: no specialty evidence in official content"
-        if classification == "IRRELEVANT":
-            return None, "", f"Rejected {url}: classified as IRRELEVANT"
         if not evidence.verified and classification not in {"FACULTY_DIRECTORY", "PERSON_PROFILE"}:
             return None, "", f"Rejected {url}: {evidence.reason}"
+
+        path = urlparse(url).path.casefold()
+        last_path_part = path.rstrip("/").rsplit("/", 1)[-1]
+        identity_text = f"{url} {title}"
+        identity_matches_specialty = text_matches_terms(identity_text, terms)
+        explicit_person_path = any(
+            marker in path
+            for marker in (
+                "/profile/", "/profiles/", "/person/", "/provider/",
+                "/faculty-and-staff/bio/", "/faculty/bio/", "/bio/", "/bios/",
+            )
+        )
+        directory_path = any(
+            marker in path
+            for marker in (
+                "/faculty", "/people", "/our-team", "/team", "/providers",
+                "/physicians", "/directory",
+            )
+        )
+        directory_title = any(
+            marker in fold_text(title)
+            for marker in ("faculty directory", "our faculty", "faculty and staff", "our team")
+        )
+        person_path = explicit_person_path or (
+            looks_like_profile_url(url, title)
+            and last_path_part not in {
+                "index", "index.html", "index.php", "default", "default.html",
+                "faculty", "staff", "people", "directory",
+            }
+            and not directory_title
+        )
+        unit_identity = identity_matches_specialty and evidence.verified and any(
+            marker in fold_text(identity_text)
+            for marker in (
+                "department", "division", "center", "centre", "institute",
+                "program", "residency", "fellowship", "research",
+            )
+        )
+        faculty_capable = (
+            person_path
+            or ((directory_path or directory_title) and identity_matches_specialty)
+            or unit_identity
+            or (is_pdf_url(url) and evidence.verified and "faculty" in fold_text(text[:5000]))
+        )
+        if not faculty_capable:
+            return None, "", f"Rejected {url}: not a specialty-focused faculty source"
+        if person_path:
+            classification = "PERSON_PROFILE"
         score = relevance_score(url, title, text, terms) + evidence.confidence
         page = PageCandidate(url, title, matched, "second_pass_audit", score, classification)
         return page, html, f"Accepted {url}: {classification} ({search.intent})"
@@ -2715,6 +2774,69 @@ def discover_second_pass_pages(
                 if html:
                     page_cache[page.url] = html
     return sorted(pages.values(), key=lambda page: (-page.score, page.url)), page_cache, log
+
+
+def discover_verified_specialty_affiliates(
+    evidence_soup: BeautifulSoup,
+    evidence_url: str,
+    institution: Institution,
+    region: str,
+    terms: list[str],
+) -> list[tuple[str, str, str, str, str]]:
+    """Verify external specialty sites linked by an official academic evidence page."""
+    candidates: dict[str, str] = {}
+    link_markers = (
+        "department", "division", "faculty", "academic", "program", "centre",
+        "center", "institute", "research", "residency", "fellowship", "website",
+    )
+    for anchor in evidence_soup.find_all("a", href=True):
+        link = normalize_url(urljoin(evidence_url, anchor.get("href", "")))
+        if not link or institution_related_domain(link, institution) or is_bad_external_source(link):
+            continue
+        label = clean_text(anchor.get_text(" ", strip=True))
+        parent_text = ""
+        if isinstance(anchor.parent, Tag):
+            parent_text = clean_text(anchor.parent.get_text(" ", strip=True))[:500]
+        link_evidence = f"{link} {label} {parent_text}"
+        if not text_matches_terms(link_evidence, terms):
+            continue
+        if not any(marker in fold_text(link_evidence) for marker in link_markers):
+            continue
+        candidates.setdefault(link, label)
+
+    def verify(candidate: tuple[str, str]) -> tuple[str, str, str, str, str] | None:
+        candidate_url, _ = candidate
+        html, final_url, _ = fetch_html(make_session(), candidate_url)
+        if not html or not final_url or is_bad_external_source(final_url):
+            return None
+        final_host = host_of(final_url)
+        if not final_host:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+        page_text = clean_text(soup.get_text(" ", strip=True))
+        specialty_evidence = classify_specialty_program_evidence(page_text, region, terms)
+        classification = classify_official_page(final_url, title, page_text, html)
+        backlink = any(
+            institution_related_domain(
+                normalize_url(urljoin(final_url, linked.get("href", ""))) or "",
+                institution,
+            )
+            for linked in soup.find_all("a", href=True)
+        )
+        named_parent = fold_text(institution.name) in fold_text(page_text)
+        if (
+            not specialty_evidence.verified
+            or classification == "IRRELEVANT"
+            or not (backlink or named_parent)
+        ):
+            return None
+        return final_url, final_host, html, title, page_text
+
+    if not candidates:
+        return []
+    with ThreadPoolExecutor(max_workers=min(6, len(candidates))) as executor:
+        return [item for item in executor.map(verify, candidates.items()) if item]
 
 
 def discover_department_pages(
@@ -2806,7 +2928,7 @@ def discover_department_pages(
         trusted_content_seed = (
             strong_directory_seed
             or trusted_pdf_seed
-            or (source == "discovery_evidence" and bool(matched))
+            or (source in {"discovery_evidence", "verified_affiliate"} and bool(matched))
         )
         exact_specialty_title = bool(terms and terms[0] in clean_text(title).lower())
         if (
@@ -2822,7 +2944,7 @@ def discover_department_pages(
         title_candidate = re.split(r"\s+[|\-:]\s+", clean_text(title))[0]
         if valid_name(title_candidate) and not has_department_identity:
             return
-        if source not in {"homepage", "discovery_evidence"} and not is_pdf and not (
+        if source not in {"homepage", "discovery_evidence", "verified_affiliate"} and not is_pdf and not (
             strong_directory_seed or exact_specialty_title or short_path_match
         ):
             return
@@ -2886,6 +3008,25 @@ def discover_department_pages(
             )
             verified_evidence_seed = evidence_specialty_verified
             log.append("Verified institution-discovery evidence checked.")
+
+            verified_affiliates = discover_verified_specialty_affiliates(
+                evidence_soup,
+                evidence_final_url,
+                institution,
+                region,
+                terms,
+            )
+            for affiliate_url, affiliate_host, affiliate_html, affiliate_title, affiliate_text in verified_affiliates:
+                if affiliate_host not in institution.additional_hosts:
+                    institution.additional_hosts.append(affiliate_host)
+                page_cache[affiliate_url] = affiliate_html
+                add_candidate(
+                    affiliate_url,
+                    affiliate_title,
+                    "verified_affiliate",
+                    affiliate_text,
+                )
+                log.append(f"Verified specialty affiliate: {affiliate_host}")
 
             evidence_parts = [
                 part for part in urlparse(evidence_final_url).path.split("/") if part
@@ -2956,7 +3097,7 @@ def discover_department_pages(
         ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
         return ordered, log, page_cache
 
-    for search_host in institution_hosts(institution):
+    for search_host in institution_search_hosts(institution):
         for item in site_search_department_urls(
             search_host,
             region,
@@ -3167,7 +3308,7 @@ CREDENTIALS = {
     "MBA", "JD", "PHARMD", "DDS", "DMD", "SCD", "EDD", "BSN", "CNM",
     "MHA", "FACC", "FRCP", "FRCS", "MRCP", "MPHIL", "BA", "BS", "MPT",
     "MSPH", "MSCR", "MSCI", "DHA", "CMPE",
-    "MLIS", "FACOI", "FACOFP", "FACEP", "FAAEM", "FACOOG", "MSCP", "FNPC",
+    "MLIS", "FACOI", "FACOFP", "FACEP", "FAAEM", "FACOOG", "MSCP", "FNPC", "MCR",
 }
 
 NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
@@ -3192,6 +3333,9 @@ NAME_STOPWORDS = {
     "coordinator", "manager", "team", "student", "students", "alumni",
     "search", "menu", "clinical", "trials", "care", "patient", "services",
     "utility", "navigation", "helpful", "links", "annual", "report",
+    "complex", "family", "planning", "oncology", "gynecology", "gynaecology",
+    "obstetrics", "urogynecology", "urogynaecology", "endocrinology", "infertility",
+    "pelvic", "maternal", "fetal", "reproductive",
 }
 
 NAME_TOKEN_RE = re.compile(r"^[A-Za-z\u00C0-\u024F'.-]+$")
@@ -3790,6 +3934,118 @@ def discover_profile_links(
     return sorted(by_identity.values(), key=lambda item: (-int(item["score"]), str(item["url"])))
 
 
+def discover_roster_profile_search_links(
+    institution: Institution,
+    roster_entries: list[FacultyEntry],
+    country_code: str,
+    disallowed_paths: list[str],
+    existing_urls: Iterable[str],
+    batch_queries: bool = False,
+) -> tuple[list[dict[str, object]], list[str]]:
+    search_hosts: list[str] = []
+    seen_hosts: set[str] = set()
+    for host in institution_search_hosts(institution):
+        root = organization_root(host)
+        if root and not (root in seen_hosts or seen_hosts.add(root)):
+            search_hosts.append(root)
+
+    del batch_queries  # Person-level verification must never trade recall for query batching.
+    if not search_hosts:
+        return [], []
+    site_clause = (
+        f"site:{search_hosts[0]}"
+        if len(search_hosts) == 1
+        else f"({' OR '.join(f'site:{host}' for host in search_hosts)})"
+    )
+    entries_by_intent: dict[str, list[FacultyEntry]] = {}
+    existing = {normalize_url(url) for url in existing_urls}
+    links: dict[str, dict[str, object]] = {}
+    log: list[str] = []
+    entries_with_urls: set[str] = set()
+
+    def collect(searches: list[PlannedSearch]) -> None:
+        for search, results in execute_search_round(
+            searches,
+            search_region_for_country(country_code),
+        ):
+            search_entries = entries_by_intent.get(search.intent, [])
+            accepted = 0
+            if search_entries:
+                for result in results:
+                    url = normalize_url(result.get("url", ""))
+                    result_text = clean_text(
+                        f'{result.get("title", "")} {result.get("body", "")} {url or ""}'
+                    )
+                    compact_result = re.sub(r"[^a-z0-9]+", "", fold_text(result_text))
+                    matched_entries = []
+                    for entry in search_entries:
+                        name_parts = normalize_person_name(entry.name).split()
+                        name_keys = {
+                            re.sub(r"[^a-z0-9]+", "", fold_text(entry.name)),
+                        }
+                        if len(name_parts) >= 2:
+                            name_keys.add(
+                                re.sub(r"[^a-z0-9]+", "", f"{name_parts[0]}{name_parts[-1]}")
+                            )
+                        if any(len(key) >= 5 and key in compact_result for key in name_keys):
+                            matched_entries.append(entry)
+                    if (
+                        not url
+                        or url in existing
+                        or not institution_related_domain(url, institution)
+                        or not path_allowed(url, disallowed_paths)
+                        or not matched_entries
+                    ):
+                        continue
+                    matched_entry = max(matched_entries, key=lambda item: len(item.normalized_name))
+                    links.setdefault(
+                        url,
+                        {
+                            "url": url,
+                            "text": matched_entry.name,
+                            "score": 100,
+                            "from": "person-level official-source audit",
+                        },
+                    )
+                    entries_with_urls.add(matched_entry.normalized_name)
+                    accepted += 1
+            log.append(
+                f"[person/{search.intent}] {search.query}: "
+                f"{len(results)} result(s), {accepted} new official URL(s)"
+            )
+
+    primary_searches: list[PlannedSearch] = []
+    for entry_index, entry in enumerate(roster_entries):
+        intent = f"primary_{entry_index}"
+        entries_by_intent[intent] = [entry]
+        primary_searches.append(
+            PlannedSearch(
+                f'{site_clause} "{entry.name}" (email OR contact OR directory)',
+                "person_audit",
+                intent,
+            )
+        )
+    collect(primary_searches)
+
+    unresolved = [
+        entry for entry in roster_entries if entry.normalized_name not in entries_with_urls
+    ]
+    expanded_searches: list[PlannedSearch] = []
+    for entry_index, entry in enumerate(unresolved):
+        intent = f"expanded_{entry_index}"
+        entries_by_intent[intent] = [entry]
+        expanded_searches.append(
+            PlannedSearch(
+                f'{site_clause} "{entry.name}" '
+                "(faculty OR professor OR physician OR researcher OR directory)",
+                "person_audit",
+                intent,
+            )
+        )
+    collect(expanded_searches)
+    return sorted(links.values(), key=lambda item: str(item["url"])), log
+
+
 # ==================================================
 # 11. Email validation
 # ==================================================
@@ -4280,6 +4536,26 @@ def final_dataframe(contacts: list[Contact]) -> pd.DataFrame:
 # 14. Institution processing pipeline
 # ==================================================
 
+def labeled_profile_fields(soup: BeautifulSoup) -> dict[str, list[str]]:
+    fields: dict[str, list[str]] = {}
+
+    def add(label: str, value: str) -> None:
+        key = fold_text(label).strip(" :|")
+        cleaned = clean_text(value)
+        if key and cleaned:
+            fields.setdefault(key, []).append(cleaned)
+
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
+        if len(cells) >= 2:
+            add(cells[0].get_text(" ", strip=True), cells[1].get_text(" ", strip=True))
+    for term in soup.find_all("dt"):
+        value = term.find_next_sibling("dd")
+        if value:
+            add(term.get_text(" ", strip=True), value.get_text(" ", strip=True))
+    return fields
+
+
 def parse_profile_page(
     url: str,
     html: str,
@@ -4290,6 +4566,7 @@ def parse_profile_page(
     roster_by_name = {entry.normalized_name: entry for entry in roster_entries}
     soup = BeautifulSoup(html, "html.parser")
     protected_emails = decode_protected_script_emails(soup)
+    labeled_fields = labeled_profile_fields(soup)
     for tag in soup(["script", "style", "noscript", "nav", "footer", "form"]):
         tag.decompose()
     page_text = clean_text(soup.get_text(" ", strip=True))
@@ -4303,6 +4580,15 @@ def parse_profile_page(
                 break
         if name:
             break
+    if not name:
+        for label in ("name", "name of record", "full name"):
+            for value in labeled_fields.get(label, []):
+                candidate = clean_name(value)
+                if valid_name(candidate):
+                    name = candidate
+                    break
+            if name:
+                break
     if not name and soup.title:
         for part in re.split(r"\s+[|\-:]\s+", clean_text(soup.title.get_text(" ", strip=True))):
             candidate = clean_name(part)
@@ -4315,7 +4601,14 @@ def parse_profile_page(
     if not roster_name_match(name, roster_names):
         return [], [Rejection(name=name, reason="Not on approved roster", source_url=url)]
 
-    matched_entry = roster_by_name.get(normalize_person_name(name))
+    matched_entry = roster_by_name.get(normalize_person_name(name)) or next(
+        (
+            entry
+            for entry in roster_entries
+            if roster_name_match(name, {entry.normalized_name})
+        ),
+        None,
+    )
     display_name = matched_entry.name if matched_entry else clean_name(name)
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
@@ -4406,6 +4699,393 @@ def parse_public_profile_payload(
     if not contacts:
         rejections.append(Rejection(display_name, "No visible institutional email", profile_url))
     return contacts, rejections
+
+
+def parse_public_directory_forms(
+    hub_url: str,
+    html: str,
+    institution: Institution,
+    disallowed_paths: list[str],
+) -> list[dict[str, object]]:
+    soup = BeautifulSoup(html, "html.parser")
+    title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    page_identity = fold_text(f"{hub_url} {title}")
+    if "directory" not in page_identity:
+        return []
+
+    forms: list[dict[str, object]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for form in soup.find_all("form"):
+        method = clean_text(form.get("method") or "get").lower()
+        if method not in {"get", "post"}:
+            continue
+        action_value = clean_text(form.get("action"))
+        action_base = hub_url
+        hub_path = urlparse(hub_url).path
+        if (
+            action_value
+            and not urlparse(action_value).scheme
+            and not action_value.startswith("/")
+            and hub_path
+            and not hub_path.endswith("/")
+            and "." not in hub_path.rsplit("/", 1)[-1]
+        ):
+            action_base = f"{hub_url}/"
+        action = normalize_url(urljoin(action_base, action_value or hub_url))
+        if (
+            not action
+            or not institution_related_domain(action, institution)
+            or not path_allowed(action, disallowed_paths)
+            or any(marker in fold_text(action) for marker in ("login", "signin", "auth"))
+        ):
+            continue
+
+        form_text = fold_text(form.get_text(" ", strip=True))
+        radio_values = {
+            clean_text(control.get("value")).casefold()
+            for control in form.find_all("input")
+            if clean_text(control.get("type")).casefold() == "radio"
+        }
+        person_search = "person" in form_text or "person" in radio_values
+        if not person_search:
+            continue
+
+        query_inputs = [
+            control
+            for control in form.find_all("input")
+            if control.get("name")
+            and clean_text(control.get("type") or "text").casefold() in {"text", "search"}
+        ]
+        if not query_inputs:
+            continue
+        query_inputs.sort(
+            key=lambda control: (
+                clean_text(control.get("name")).casefold() not in {"query", "name", "keyword", "term"},
+                clean_text(control.get("name")).casefold(),
+            )
+        )
+        query_field = clean_text(query_inputs[0].get("name"))
+        if not query_field:
+            continue
+
+        static_fields: dict[str, str] = {}
+        radio_groups: dict[str, list[Tag]] = {}
+        for control in form.find_all("input"):
+            name = clean_text(control.get("name"))
+            input_type = clean_text(control.get("type") or "text").casefold()
+            if not name or name == query_field:
+                continue
+            if input_type == "hidden":
+                static_fields[name] = clean_text(control.get("value"))
+            elif input_type == "radio":
+                radio_groups.setdefault(name, []).append(control)
+            elif input_type == "submit" and name not in static_fields:
+                static_fields[name] = clean_text(control.get("value"))
+        for name, controls in radio_groups.items():
+            chosen = next((control for control in controls if control.has_attr("checked")), None)
+            chosen = chosen or next(
+                (control for control in controls if clean_text(control.get("value")).casefold() == "person"),
+                controls[0],
+            )
+            static_fields[name] = clean_text(chosen.get("value"))
+        for select in form.find_all("select", attrs={"name": True}):
+            options = select.find_all("option")
+            if not options:
+                continue
+            chosen = next((option for option in options if option.has_attr("selected")), options[0])
+            static_fields[clean_text(select.get("name"))] = clean_text(
+                chosen.get("value") if chosen.get("value") is not None else chosen.get_text(" ", strip=True)
+            )
+
+        key = (method, action, query_field)
+        if key in seen:
+            continue
+        seen.add(key)
+        forms.append(
+            {
+                "hub_url": hub_url,
+                "action": action,
+                "method": method,
+                "query_field": query_field,
+                "static_fields": static_fields,
+            }
+        )
+    return forms
+
+
+def discover_public_directory_forms(
+    page_cache: dict[str, str],
+    institution: Institution,
+    disallowed_paths: list[str],
+) -> tuple[list[dict[str, object]], list[str]]:
+    candidate_hubs: set[str] = set()
+    for page_url, html in page_cache.items():
+        soup = BeautifulSoup(html, "html.parser")
+        if "directory" in fold_text(f"{page_url} {soup.title.get_text(' ', strip=True) if soup.title else ''}"):
+            candidate_hubs.add(page_url)
+        for anchor in soup.find_all("a", href=True):
+            link = normalize_url(urljoin(page_url, anchor.get("href", "")))
+            identity = fold_text(f"{link or ''} {anchor.get_text(' ', strip=True)}")
+            if (
+                link
+                and "directory" in identity
+                and institution_related_domain(link, institution)
+                and path_allowed(link, disallowed_paths)
+                and not any(marker in identity for marker in ("login", "signin", "intranet"))
+            ):
+                candidate_hubs.add(link)
+
+    def inspect_hub(hub_url: str) -> tuple[list[dict[str, object]], str]:
+        cached = page_cache.get(hub_url)
+        html = cached
+        final_url = hub_url
+        if html is None:
+            html, final_url, error = fetch_html(make_session(), hub_url)
+            if not html or not final_url:
+                return [], f"Directory candidate unavailable: {hub_url} ({error or 'unavailable'})"
+        if not institution_related_domain(final_url, institution):
+            return [], f"Directory candidate left the official domain: {hub_url}"
+        forms = parse_public_directory_forms(final_url, html, institution, disallowed_paths)
+        if forms:
+            return forms, f"Verified public person directory: {final_url}"
+        return [], f"Rejected non-person directory candidate: {final_url}"
+
+    forms_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    log: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(candidate_hubs) or 1)) as executor:
+        for found_forms, message in executor.map(inspect_hub, sorted(candidate_hubs)):
+            log.append(message)
+            for form in found_forms:
+                action = str(form["action"])
+                key = (
+                    str(form["method"]),
+                    organization_root(host_of(action)),
+                    urlparse(action).path.rstrip("/").casefold(),
+                    str(form["query_field"]),
+                )
+                forms_by_key.setdefault(key, form)
+    return list(forms_by_key.values()), log
+
+
+def directory_response_block_reason(page_text: str) -> str | None:
+    folded = fold_text(page_text)
+    markers = (
+        ("viewed too many pages", "directory access threshold reached"),
+        ("too many requests", "directory rate limited the request"),
+        ("access denied", "directory denied access"),
+        ("verify you are human", "directory requested human verification"),
+        ("captcha", "directory requested human verification"),
+    )
+    for marker, reason in markers:
+        if marker in folded:
+            return reason
+    return None
+
+
+def matching_directory_record_soups(
+    soup: BeautifulSoup,
+    entry: FacultyEntry,
+) -> list[BeautifulSoup]:
+    roster_names = {entry.normalized_name}
+    seeds: list[Tag] = []
+    name_labels = {"name", "name of record", "full name", "display name"}
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
+        if len(cells) >= 2 and fold_text(cells[0].get_text(" ", strip=True)).strip(" :|") in name_labels:
+            if roster_name_match(cells[1].get_text(" ", strip=True), roster_names):
+                seeds.append(cells[1])
+    for term in soup.find_all("dt"):
+        if fold_text(term.get_text(" ", strip=True)).strip(" :|") not in name_labels:
+            continue
+        value = term.find_next_sibling("dd")
+        if value and roster_name_match(value.get_text(" ", strip=True), roster_names):
+            seeds.append(value)
+    for element in soup.find_all(
+        ["h1", "h2", "h3", "h4", "td", "dd", "span", "strong", "b", "a"]
+    ):
+        text = clean_text(element.get_text(" ", strip=True))
+        if len(text) <= 120 and roster_name_match(text, roster_names):
+            seeds.append(element)
+
+    records: dict[str, BeautifulSoup] = {}
+    container_tags = {"article", "section", "li", "div", "table", "tbody", "main"}
+    for seed in seeds:
+        candidates: list[tuple[int, Tag]] = []
+        for ancestor in [seed, *list(seed.parents)]:
+            if not isinstance(ancestor, Tag) or ancestor.name in {"body", "html", "form"}:
+                if isinstance(ancestor, Tag) and ancestor.name in {"body", "html"}:
+                    break
+                continue
+            if ancestor.name not in container_tags:
+                continue
+            record_text = clean_text(ancestor.get_text(" ", strip=True))
+            if len(record_text) > 12000:
+                continue
+            record_html = str(ancestor)
+            if decode_visible_emails(record_html):
+                candidates.append((len(record_text), ancestor))
+        if candidates:
+            _, container = min(candidates, key=lambda item: item[0])
+            html = str(container)
+            records.setdefault(html, BeautifulSoup(html, "html.parser"))
+
+    if records:
+        return list(records.values())
+
+    page_text = clean_text(soup.get_text(" ", strip=True))
+    if roster_name_match(page_text, roster_names) and decode_visible_emails(str(soup)):
+        return [soup]
+    return []
+
+
+def parse_public_directory_response(
+    final_url: str,
+    html: str,
+    institution: Institution,
+    entry: FacultyEntry,
+    terms: list[str],
+) -> tuple[list[Contact], list[Rejection], str | None]:
+    soup = BeautifulSoup(html, "html.parser")
+    page_text = clean_text(soup.get_text(" ", strip=True))
+    block_reason = directory_response_block_reason(page_text)
+    if block_reason:
+        return [], [], block_reason
+    if "no matches found" in fold_text(page_text):
+        return [], [], None
+
+    contacts: list[Contact] = []
+    rejections: list[Rejection] = []
+    for record_soup in matching_directory_record_soups(soup, entry):
+        response_fields = labeled_profile_fields(record_soup)
+        department_text = clean_text(
+            " ".join(
+                value
+                for label in ("department", "department name", "academic department", "unit")
+                for value in response_fields.get(label, [])
+            )
+        )
+        if department_text and not text_matches_terms(department_text, terms):
+            rejections.append(
+                Rejection(
+                    entry.name,
+                    "Directory record belongs to another department",
+                    final_url,
+                    department_text,
+                )
+            )
+            continue
+        found_contacts, found_rejections = parse_profile_page(
+            final_url,
+            str(record_soup),
+            institution,
+            [entry],
+        )
+        contacts.extend(found_contacts)
+        rejections.extend(found_rejections)
+
+    for contact in contacts:
+        contact.method = "Official university directory"
+        contact.profile_url = final_url
+        contact.email_source_url = final_url
+    return deduplicate_contacts(contacts), rejections, None
+
+
+def crawl_public_directory_forms(
+    forms: list[dict[str, object]],
+    roster_entries: list[FacultyEntry],
+    institution: Institution,
+    terms: list[str],
+    delay_seconds: float,
+    disallowed_paths: list[str],
+) -> tuple[list[Contact], list[Rejection], list[str], list[str]]:
+    if not forms or not roster_entries:
+        return [], [], [], []
+
+    def lookup(payload: tuple[dict[str, object], FacultyEntry]) -> tuple[list[Contact], list[Rejection], str, str | None]:
+        form, entry = payload
+        hub_url = str(form["hub_url"])
+        session = make_session()
+        hub_html, hub_final_url, hub_error = fetch_html(session, hub_url)
+        if not hub_html or not hub_final_url:
+            return [], [], "", f"{hub_url}: {hub_error or 'directory unavailable'}"
+        fresh_forms = parse_public_directory_forms(
+            hub_final_url,
+            hub_html,
+            institution,
+            disallowed_paths,
+        )
+        fresh_form = next(
+            (
+                candidate
+                for candidate in fresh_forms
+                if str(candidate["method"]) == str(form["method"])
+                and str(candidate["query_field"]) == str(form["query_field"])
+                and normalize_url(str(candidate["action"])) == normalize_url(str(form["action"]))
+            ),
+            form,
+        )
+        action = str(fresh_form["action"])
+        method = str(fresh_form["method"])
+        fields = dict(fresh_form.get("static_fields", {}))
+        fields[str(fresh_form["query_field"])] = entry.name
+        try:
+            if method == "post":
+                response = session.post(
+                    action,
+                    data=fields,
+                    headers=HEADERS,
+                    timeout=DEFAULT_TIMEOUT,
+                    allow_redirects=True,
+                )
+            else:
+                response = session.get(
+                    action,
+                    params=fields,
+                    headers=HEADERS,
+                    timeout=DEFAULT_TIMEOUT,
+                    allow_redirects=True,
+                )
+            if response.status_code in {401, 403, 429}:
+                return [], [], "", f"{action}: blocked or rate limited ({response.status_code})"
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            return [], [], "", f"{action}: {exc.__class__.__name__}"
+        final_url = normalize_url(response.url)
+        if not final_url or not institution_related_domain(final_url, institution):
+            return [], [], "", None
+        found_contacts, found_rejections, directory_block = parse_public_directory_response(
+            final_url,
+            response.text,
+            institution,
+            entry,
+            terms,
+        )
+        if directory_block:
+            return [], [], "", f"{action}: {directory_block}"
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        return (
+            found_contacts,
+            found_rejections,
+            f"{entry.name}: {len(found_contacts)} public directory contact(s)",
+            None,
+        )
+
+    contacts: list[Contact] = []
+    rejections: list[Rejection] = []
+    log: list[str] = []
+    blocked: list[str] = []
+    for form in forms:
+        for entry in roster_entries:
+            found_contacts, found_rejections, message, blocked_message = lookup((form, entry))
+            contacts.extend(found_contacts)
+            rejections.extend(found_rejections)
+            if message:
+                log.append(message)
+            if blocked_message:
+                blocked.append(blocked_message)
+                break
+    return deduplicate_contacts(contacts), rejections, log, blocked
 
 
 def crawl_profiles(
@@ -4846,6 +5526,7 @@ def process_institution(
         existing_urls={page.url for page in department_pages} | set(page_cache),
         disallowed_paths=disallowed_paths,
         country_code=country_code,
+        compact=bool(roster_entries),
     )
     report.notes.extend(audit_log)
     report.department_pages += len(audit_pages)
@@ -4923,12 +5604,99 @@ def process_institution(
     else:
         report.notes.append("Second-pass audit found no new qualifying official pages.")
 
+    contacts_before_directory = deduplicate_contacts(
+        initial_personal_contacts
+        + audit_profile_contacts
+        + audit_card_contacts
+        + audit_pdf_contacts
+    )
+    covered_before_directory = {
+        normalize_person_name(contact.name)
+        for contact in contacts_before_directory
+    }
+    directory_roster = [
+        entry
+        for entry in roster_entries
+        if entry.normalized_name not in covered_before_directory
+    ]
+    directory_contacts: list[Contact] = []
+    directory_forms: list[dict[str, object]] = []
+    if directory_roster:
+        update_activity("🔎 Checking official university directories...")
+        directory_forms, directory_discovery_log = discover_public_directory_forms(
+            page_cache,
+            institution,
+            disallowed_paths,
+        )
+        report.notes.extend(directory_discovery_log)
+        if directory_forms:
+            directory_contacts, directory_rejections, directory_log, directory_blocked = crawl_public_directory_forms(
+                directory_forms,
+                directory_roster,
+                institution,
+                terms,
+                delay_seconds,
+                disallowed_paths,
+            )
+            report.profiles_checked += len(directory_log) + len(directory_blocked)
+            report.rejections.extend(directory_rejections)
+            report.blocked_or_unreadable.extend(directory_blocked)
+            report.notes.extend(directory_log)
+            report.notes.append(
+                f"Official directory audit verified {len(directory_contacts)} additional contact(s) "
+                f"from {len(directory_roster)} unresolved roster candidate(s)."
+            )
+
+    contacts_before_person_search = deduplicate_contacts(
+        contacts_before_directory + directory_contacts
+    )
+    covered_before_person_search = {
+        normalize_person_name(contact.name)
+        for contact in contacts_before_person_search
+    }
+    person_search_roster = [
+        entry
+        for entry in roster_entries
+        if entry.normalized_name not in covered_before_person_search
+    ]
+    person_search_contacts: list[Contact] = []
+    if person_search_roster:
+        update_activity("🔎 Auditing each unresolved faculty member...")
+        person_search_links, person_search_discovery_log = discover_roster_profile_search_links(
+            institution,
+            person_search_roster,
+            country_code,
+            disallowed_paths,
+            set(page_cache)
+            | {entry.profile_url for entry in roster_entries if entry.profile_url},
+            batch_queries=False,
+        )
+        report.notes.extend(person_search_discovery_log)
+        if person_search_links:
+            person_search_contacts, person_search_rejections, person_search_log, person_search_blocked = crawl_profiles(
+                person_search_links,
+                institution,
+                person_search_roster,
+                delay_seconds,
+                disallowed_paths,
+            )
+            report.profiles_checked += len(person_search_log)
+            report.rejections.extend(person_search_rejections)
+            report.blocked_or_unreadable.extend(person_search_blocked)
+            report.notes.extend(person_search_log)
+            report.notes.append(
+                f"Person-level official-source audit verified {len(person_search_contacts)} additional contact(s) "
+                f"for {len(person_search_roster)} unresolved roster candidate(s)."
+            )
+
     update_activity(f"✨ Finishing {institution.name}...")
     personal_contacts = deduplicate_contacts(
         initial_personal_contacts
         + audit_profile_contacts
         + audit_card_contacts
         + audit_pdf_contacts
+        + directory_contacts
+        + person_search_contacts
     )
     if personal_contacts:
         report.contacts_found = len(personal_contacts)
