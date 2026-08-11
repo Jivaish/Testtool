@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 import time
 import unicodedata
@@ -8,6 +9,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import parse_qs, quote_plus, unquote, urldefrag, urljoin, urlparse, urlunparse
 
@@ -72,6 +74,8 @@ BAD_SOURCE_HOST_MARKERS = (
     "topuniversities.", "mastersportal.", "bachelorsportal.", "findaphd.",
     "indeed.", "glassdoor.", "salary.", "courseadvisor.", "collegefactual.",
     "collegesimply.", "petersons.", "study.com", "degreesearch.",
+    "ama-assn.", "residencyexplorer.", "residencyprogramslist.",
+    "matcharesident.", "freida.", "medresidency.",
 )
 
 INSTITUTION_WORDS = (
@@ -711,14 +715,36 @@ COUNTRY_DOMAIN_HINTS = {
 }
 
 
-def ddg_search(query: str) -> list[dict[str, str]]:
+DDGS_REGION_BY_COUNTRY = {
+    "AU": "au-en", "AT": "at-de", "BE": "be-fr", "BR": "br-pt",
+    "CA": "ca-en", "CH": "ch-de", "DE": "de-de", "DK": "dk-da",
+    "ES": "es-es", "FI": "fi-fi", "FR": "fr-fr", "GB": "uk-en",
+    "HK": "hk-tzh", "IN": "in-en", "ID": "id-en", "IE": "ie-en",
+    "IT": "it-it", "JP": "jp-jp", "KR": "kr-kr", "MX": "mx-es",
+    "MY": "my-en", "NL": "nl-nl", "NO": "no-no", "NZ": "nz-en",
+    "PH": "ph-en", "PL": "pl-pl", "PT": "pt-pt", "RU": "ru-ru",
+    "SE": "se-sv", "SG": "sg-en", "TR": "tr-tr", "TW": "tw-tzh",
+    "US": "us-en", "ZA": "za-en",
+}
+
+
+def search_region_for_country(country_code: str = "") -> str:
+    return DDGS_REGION_BY_COUNTRY.get((country_code or "").upper(), "wt-wt")
+
+
+def ddg_search(query: str, search_region: str = "wt-wt") -> list[dict[str, str]]:
     if DDGS is None:
         return []
     for attempt in range(2):
         results: list[dict[str, str]] = []
         try:
             with DDGS(timeout=8) as ddgs:
-                for item in ddgs.text(query, max_results=None):
+                for item in ddgs.text(
+                    query,
+                    region=search_region or "wt-wt",
+                    backend="auto",
+                    max_results=None,
+                ):
                     href = item.get("href") or item.get("url") or ""
                     title = item.get("title") or ""
                     body = item.get("body") or item.get("snippet") or ""
@@ -860,6 +886,14 @@ def valid_institution_name(value: str, host: str) -> bool:
         return False
     if re.search(r"\b(?:university|college)\b.*\bsystem\s*$", folded):
         return False
+    if re.search(r"\bprogram\s*$", folded):
+        return False
+    if folded in {
+        "university medical center", "university medical centre",
+        "university hospital", "academic medical center", "academic medical centre",
+        "medical center", "medical centre", "teaching hospital",
+    }:
+        return False
     if "top ranked university" in folded:
         return False
     if re.match(r"^(about|contact|welcome|department|division|faculty|school news|how|what|why|when|where|guide|best|top|ranking|rankings)\b", folded):
@@ -870,6 +904,105 @@ def valid_institution_name(value: str, host: str) -> bool:
     has_medical_brand = any(word in folded for word in ("medicine", "health", "clinic", "cancer center", "cancer centre"))
     is_acronym = name.replace("&", "").replace(" ", "").isalnum() and name.upper() == name and len(name) <= 16
     return has_identity or has_medical_brand or (is_acronym and is_academic_domain(host))
+
+
+def institution_host_matches_brand(host: str, name: str) -> bool:
+    if is_academic_domain(host):
+        return True
+    root_label = organization_root(host).split(".", 1)[0]
+    compact_host = re.sub(r"[^a-z0-9]+", "", root_label)
+    name_tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", fold_text(name))
+        if token not in {
+            "the", "of", "at", "and", "for", "university", "college", "school",
+            "hospital", "health", "medical", "medicine", "institute", "center", "centre",
+        }
+    ]
+    compact_name = "".join(name_tokens)
+    acronym = "".join(token[0] for token in name_tokens if token)
+    branded_host = bool(
+        compact_host
+        and (
+            compact_host in compact_name
+            or compact_name in compact_host
+            or (len(acronym) >= 2 and acronym == compact_host)
+            or any(len(token) >= 4 and token in compact_host for token in name_tokens)
+        )
+    )
+    institutional_host = any(
+        marker in compact_host
+        for marker in (
+            "university", "college", "school", "hospital", "health", "medical",
+            "medicine", "clinic", "institute", "academy",
+        )
+    )
+    return branded_host or institutional_host
+
+
+def institution_name_key(name: str) -> str:
+    folded = re.sub(r"^the\s+", "", fold_text(clean_institution_name_candidate(name)))
+    folded = folded.replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", "", folded)
+
+
+def institution_name_initialism(name: str) -> str:
+    ignored = {"the", "of", "at", "and", "for", "in"}
+    words = [word for word in re.findall(r"[a-z0-9]+", fold_text(name)) if word not in ignored]
+    return "".join(word[0] for word in words if word)
+
+
+def institution_subdomain_prefix(host: str) -> str:
+    root = organization_root(host)
+    normalized = (host or "").lower().removeprefix("www.")
+    if normalized == root or not normalized.endswith("." + root):
+        return ""
+    return normalized[: -(len(root) + 1)].split(".")[0]
+
+
+def deduplicate_institutions(institutions: Iterable[Institution]) -> list[Institution]:
+    by_name: dict[str, Institution] = {}
+    for item in institutions:
+        if not valid_institution_name(item.name, item.host):
+            continue
+        key = institution_name_key(item.name)
+        if not key:
+            continue
+        existing = by_name.get(key)
+        if not existing or (
+            item.score,
+            int(is_academic_domain(item.host)),
+            -len(item.official_url),
+        ) > (
+            existing.score,
+            int(is_academic_domain(existing.host)),
+            -len(existing.official_url),
+        ):
+            by_name[key] = item
+    unique_items = list(by_name.values())
+    by_domain: dict[str, list[Institution]] = {}
+    for item in unique_items:
+        by_domain.setdefault(organization_root(item.host), []).append(item)
+
+    merged: list[Institution] = []
+    for domain_items in by_domain.values():
+        scoped_items = [
+            item
+            for item in domain_items
+            if institution_subdomain_prefix(item.host)
+            and institution_subdomain_prefix(item.host) == institution_name_initialism(item.name)
+        ]
+        if scoped_items:
+            scoped_ids = {id(item) for item in scoped_items}
+            merged.extend(
+                item
+                for item in domain_items
+                if id(item) in scoped_ids
+                or institution_subdomain_prefix(item.host) == institution_name_initialism(item.name)
+            )
+        else:
+            merged.extend(domain_items)
+    return sorted(merged, key=lambda item: (-item.score, item.name.casefold()))
 
 
 def extract_institution_name(soup: BeautifulSoup, search_title: str, host: str) -> str | None:
@@ -883,7 +1016,7 @@ def extract_institution_name(soup: BeautifulSoup, search_title: str, host: str) 
                 candidates.append((weight + 8, part))
 
     homepage_title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
-    for source_title, weight in ((homepage_title, 100), (search_title, 20)):
+    for source_title, weight in ((homepage_title, 100),):
         if not source_title:
             continue
         candidates.append((weight, source_title))
@@ -1167,9 +1300,10 @@ def discover_institutions(
     institutions_by_root: dict[str, Institution] = {}
     candidates_by_root: dict[str, dict[str, tuple[int, str, dict[str, str]]]] = {}
     log: list[str] = []
+    search_region = search_region_for_country(country_code)
 
     with ThreadPoolExecutor(max_workers=min(6, len(queries))) as executor:
-        search_groups = list(executor.map(ddg_search, queries))
+        search_groups = list(executor.map(lambda query: ddg_search(query, search_region), queries))
 
     for query, search_results in zip(queries, search_groups):
         log.append(f"{query}: {len(search_results)} result(s)")
@@ -1218,6 +1352,69 @@ def discover_institutions(
             if not existing_candidate or new_rank > existing_rank:
                 root_candidates[evidence_key] = (score, query, enriched_result)
 
+    term_query = " OR ".join(f'"{term}"' for term in discovery_terms)
+    follow_up_targets = [
+        (root, payloads)
+        for root, payloads in candidates_by_root.items()
+        if payloads
+        and not any(payload[2]["specialty_evidence"] == "1" for payload in payloads.values())
+        and max(payload[0] for payload in payloads.values()) >= 45
+        and any(payload[2].get("region_evidence") == "1" for payload in payloads.values())
+        and is_academic_domain(root)
+    ]
+
+    def official_specialty_follow_up(
+        target: tuple[str, dict[str, tuple[int, str, dict[str, str]]]],
+    ) -> tuple[str, str, list[dict[str, str]]]:
+        root, _ = target
+        query = (
+            f"site:{root} ({term_query}) "
+            '(faculty OR curriculum OR clerkship OR "clinical rotation")'
+        )
+        return root, query, ddg_search(query, search_region)
+
+    if follow_up_targets:
+        with ThreadPoolExecutor(max_workers=min(12, len(follow_up_targets))) as executor:
+            follow_up_groups = executor.map(official_specialty_follow_up, follow_up_targets)
+            for root, query, results in follow_up_groups:
+                accepted = 0
+                root_candidates = candidates_by_root[root]
+                base_candidate_url = max(
+                    root_candidates.values(),
+                    key=lambda payload: payload[0],
+                )[2]["candidate_url"]
+                for result in results:
+                    normalized_result_url = normalize_url(result["url"])
+                    if not normalized_result_url or not related_official_domain(normalized_result_url, root):
+                        continue
+                    result_text = fold_text(
+                        f"{result['url']} {result['title']} {result['body']}"
+                    )
+                    if not any(fold_text(term) in result_text for term in discovery_terms):
+                        continue
+                    score = score_institution_result(
+                        result["url"],
+                        result["title"],
+                        result["body"],
+                        country,
+                        country_code,
+                        discovery_terms,
+                    )
+                    if score < 35:
+                        continue
+                    evidence_key = normalized_result_url
+                    enriched_result = {
+                        **result,
+                        "candidate_url": base_candidate_url,
+                        "specialty_evidence": "1",
+                        "region_evidence": "1" if contains_location_term(result_text, region) else "0",
+                    }
+                    existing_candidate = root_candidates.get(evidence_key)
+                    if not existing_candidate or score > existing_candidate[0]:
+                        root_candidates[evidence_key] = (score, query, enriched_result)
+                        accepted += 1
+                log.append(f"Official specialty follow-up for {root}: {accepted} evidence result(s)")
+
     def verify_candidate(
         grouped_payload: tuple[str, list[tuple[int, str, dict[str, str]]]],
     ) -> tuple[str, Institution | None, str]:
@@ -1252,6 +1449,9 @@ def discover_institutions(
             return root, None, f"Rejected {candidate_url}: no valid institution brand found on homepage"
         if not homepage_has_academic_identity(name, soup, verification_host):
             message = f"Rejected {candidate_url}: homepage did not verify an academic or teaching institution"
+            return root, None, message
+        if not institution_host_matches_brand(verification_host, name):
+            message = f"Rejected {candidate_url}: domain did not match the institution brand"
             return root, None, message
         def check_evidence(
             payload: tuple[int, str, dict[str, str]],
@@ -1346,10 +1546,7 @@ def discover_institutions(
             if not existing or item.score > existing.score:
                 institutions_by_root[root] = item
 
-    institutions = sorted(
-        institutions_by_root.values(),
-        key=lambda item: (-item.score, item.name.lower()),
-    )
+    institutions = deduplicate_institutions(institutions_by_root.values())
     return institutions, log
 
 
@@ -1429,7 +1626,13 @@ def common_department_paths(official_url: str, terms: list[str]) -> list[str]:
     return sorted(paths)
 
 
-def site_search_department_urls(host: str, region: str, specialty: str, terms: list[str]) -> list[dict[str, str]]:
+def site_search_department_urls(
+    host: str,
+    region: str,
+    specialty: str,
+    terms: list[str],
+    search_region: str = "wt-wt",
+) -> list[dict[str, str]]:
     primary = terms[0] if terms else specialty
     short_alias = next(
         (
@@ -1462,7 +1665,7 @@ def site_search_department_urls(host: str, region: str, specialty: str, terms: l
     results: list[dict[str, str]] = []
     seen: set[str] = set()
     with ThreadPoolExecutor(max_workers=len(queries)) as executor:
-        search_groups = list(executor.map(ddg_search, queries))
+        search_groups = list(executor.map(lambda query: ddg_search(query, search_region), queries))
     for query, search_results in zip(queries, search_groups):
         for item in search_results:
             url = normalize_url(item["url"])
@@ -1480,6 +1683,7 @@ def discover_department_pages(
     specialty: str,
     terms: list[str],
     disallowed_paths: list[str],
+    country_code: str = "",
 ) -> tuple[list[PageCandidate], list[str], dict[str, str]]:
     session = make_session()
     official_host = institution.host
@@ -1704,7 +1908,13 @@ def discover_department_pages(
         ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
         return ordered, log, page_cache
 
-    for item in site_search_department_urls(official_host, region, specialty, terms):
+    for item in site_search_department_urls(
+        official_host,
+        region,
+        specialty,
+        terms,
+        search_region_for_country(country_code),
+    ):
         add_candidate(item["url"], item.get("title", ""), "site_search", item.get("body", ""))
     log.append("Official-site search checked.")
 
@@ -3384,6 +3594,7 @@ def process_institution(
         specialty=specialty,
         terms=terms,
         disallowed_paths=disallowed_paths,
+        country_code=country_code,
     )
     report.department_pages = len(department_pages)
     report.notes.extend(department_log[:5])
@@ -3498,26 +3709,95 @@ def format_elapsed(seconds: float) -> str:
 
 st.set_page_config(page_title=APP_NAME, page_icon="GM", layout="wide")
 
+watermark_path = Path(__file__).parent / "assets" / "aventis-conference-watermark.png"
+watermark_data = ""
+if watermark_path.exists():
+    watermark_data = base64.b64encode(watermark_path.read_bytes()).decode("ascii")
+
 st.markdown(
-    """
+    f"""
     <style>
-    .block-container { max-width: 1180px; padding-top: 2.5rem; }
-    div[data-testid="stMetric"] {
+    .stApp::before {{
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        background: url("data:image/png;base64,{watermark_data}") right center / cover no-repeat;
+        opacity: 0.055;
+        animation: aventis-watermark-drift 22s ease-in-out infinite alternate;
+    }}
+    .stApp > * {{ position: relative; z-index: 1; }}
+    @keyframes aventis-watermark-drift {{
+        from {{ transform: translate3d(0, 0, 0) scale(1); opacity: 0.045; }}
+        to {{ transform: translate3d(0.8rem, -0.35rem, 0) scale(1.015); opacity: 0.075; }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+        .stApp::before {{ animation: none; }}
+    }}
+    .block-container {{ max-width: 1180px; padding-top: 1.5rem; }}
+    .aventis-brand {{
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+        margin-bottom: 1.1rem;
+        color: #dbeafe;
+        letter-spacing: 0;
+    }}
+    .aventis-monogram {{
+        display: grid;
+        place-items: center;
+        width: 2.4rem;
+        height: 2.4rem;
+        color: #ffffff;
+        background: #0877b9;
+        border-left: 0.3rem solid #57c66c;
+        border-radius: 6px;
+        font-size: 1.45rem;
+        font-weight: 800;
+    }}
+    .aventis-wordmark {{ font-size: 1rem; font-weight: 700; line-height: 1.05; }}
+    .aventis-wordmark small {{
+        display: block;
+        color: #74c9ee;
+        font-size: 0.66rem;
+        margin-top: 0.22rem;
+    }}
+    button[data-testid="stBaseButton-primary"] {{
+        background: #0877b9;
+        border-color: #0877b9;
+        color: #ffffff;
+    }}
+    button[data-testid="stBaseButton-primary"]:hover {{
+        background: #005b91;
+        border-color: #005b91;
+    }}
+    div[data-testid="stMetric"] {{
         border: 1px solid #e6e8ef;
         border-radius: 8px;
         padding: 0.65rem 0.8rem;
         background: #fbfcff;
-    }
+    }}
     div[data-testid="stMetric"] [data-testid="stMetricLabel"],
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
         color: #101828;
-    }
-    .small-note { color: #667085; font-size: 0.92rem; line-height: 1.45; }
+    }}
+    .small-note {{ color: #9ba7ba; font-size: 0.92rem; line-height: 1.45; }}
+    @media (max-width: 640px) {{
+        .block-container {{ padding-top: 3.75rem; }}
+        .aventis-brand {{ margin-bottom: 0.8rem; }}
+        .stApp::before {{ background-position: 72% center; opacity: 0.04; }}
+    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    '<div class="aventis-brand"><span class="aventis-monogram">A</span>'
+    '<span class="aventis-wordmark">AVENTIS<small>CONFERENCES</small></span></div>',
+    unsafe_allow_html=True,
+)
 st.title(APP_NAME)
 st.markdown(
     '<p class="small-note">Finds publicly visible official faculty work emails from official institutional sources only. '
@@ -3618,7 +3898,13 @@ if discover_clicked:
     st.session_state.reports = []
     st.session_state.discovery_scope = current_scope
 
-institutions: list[Institution] = st.session_state.institutions
+institutions: list[Institution] = deduplicate_institutions(st.session_state.institutions)
+if institutions != st.session_state.institutions:
+    st.session_state.institutions = institutions
+    available_names = {item.name for item in institutions}
+    st.session_state.selected_institution_names = [
+        name for name in st.session_state.selected_institution_names if name in available_names
+    ]
 if institutions:
     st.subheader("Discovered Institutions")
     st.caption("Institution names are shown here. Official URLs are stored internally and visible in diagnostics.")

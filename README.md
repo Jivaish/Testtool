@@ -7,6 +7,18 @@ selected location from that evidence, and then follows only relevant official pr
 department, directory, and profile pages. It does not use paid APIs, AI APIs, login-only
 data, third-party people databases, or guessed email patterns.
 
+Public web discovery uses localized search regions when available and a global search
+region everywhere else. Multiple institution, specialty, curriculum, clerkship, faculty,
+and department query formulations are searched without a result-count cap. Candidates
+must then pass official-site brand, location, and specialty-evidence checks.
+
+Institution results are canonicalized by verified organization identity, so multiple
+subdomains and alternate result titles do not create repeated institutions. Generic
+facility labels and residency-program titles are not treated as universities or medical
+schools. When a strong official academic candidate lacks specialty evidence in the first
+result set, the app performs a targeted follow-up restricted to that institution's own
+domain.
+
 Country selection uses the full ISO country list. The location dropdown combines official country subdivisions with searchable city data, and includes an all-regions option.
 
 ## Output
@@ -73,6 +85,7 @@ source .venv/bin/activate
    - `requirements.txt`
    - `README.md`
    - `.gitignore`
+   - `assets/aventis-conference-watermark.png`
 3. Go to Streamlit Community Cloud.
 4. Select the repository.
 5. Set the main file path to `app.py`.
@@ -84,7 +97,7 @@ Try:
 
 - Country: `United States`
 - State / Province / Region: `Alabama`
-- Department / Specialty: `Nursing`
+- Department / Specialty: `Obstetrics and Gynecology`
 
 Then click **Discover Institutions**, select one or more institutions, and click **Search Selected Institutions**.
 
@@ -98,6 +111,10 @@ institutions are rejected.
 The institution search uses a live activity feed tied to actual crawler stages. Completed
 institutions remain visible, the current and next institutions are identified, and the
 percentage bar is kept as a secondary indicator.
+
+The interface uses a responsive Aventis-inspired masthead and a subtle animated medical
+conference watermark. Motion is disabled automatically for users who prefer reduced
+motion.
 
 The crawler does not cap the number of institutions, department pages, faculty pages, profiles, pagination links, sitemap entries, or PDF pages it processes. Broad searches can therefore take longer. The request-delay control remains available to keep crawling polite.
 
