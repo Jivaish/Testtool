@@ -40,6 +40,11 @@ try:
 except Exception:  # pragma: no cover - PDF extraction is optional at runtime
     PdfReader = None
 
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:  # pragma: no cover - browser rendering is an optional fallback
+    sync_playwright = None
+
 
 # ==================================================
 # 1. Imports and constants
@@ -55,6 +60,206 @@ HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Embedded from the supplied medical artwork so app-only deployments retain it.
+EMBEDDED_BACKGROUND_WEBP = (
+    "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"
+)
 
 DEFAULT_TIMEOUT = 16
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
@@ -369,6 +574,72 @@ SPECIALTY_DISCOVERY_TERMS: dict[str, list[str]] = {
     "Custom Department": [],
 }
 
+SPECIALTY_UNIT_TERMS: dict[str, list[str]] = {
+    "Obstetrics and Gynecology": [
+        "obstetrics and gynecology",
+        "obstetrics & gynecology",
+        "ob/gyn",
+        "obgyn",
+        "women's reproductive health",
+        "maternal-fetal medicine",
+        "reproductive endocrinology and infertility",
+        "reproductive endocrinology",
+        "reproductive medicine",
+        "gynecologic oncology",
+        "gyn oncology",
+        "urogynecology",
+        "female pelvic medicine",
+        "pelvic medicine",
+        "minimally invasive gynecologic surgery",
+        "family planning",
+        "complex family planning",
+        "reproductive health",
+        "maternal health",
+        "fetal medicine",
+        "prenatal diagnosis",
+        "high-risk pregnancy",
+        "general obstetrics",
+        "general gynecology",
+        "academic specialists in general obstetrics and gynecology",
+        "center for women's health",
+        "women's health research",
+        "reproductive sciences",
+    ],
+}
+
+SPECIALTY_UNIT_GROUPS: dict[str, list[tuple[str, list[str]]]] = {
+    "Obstetrics and Gynecology": [
+        ("obgyn", ["obstetrics and gynecology", "obstetrics & gynecology", "ob/gyn", "obgyn"]),
+        ("womens_reproductive_health", ["women's reproductive health"]),
+        ("maternal_fetal_medicine", ["maternal-fetal medicine", "maternal fetal medicine", "mfm"]),
+        (
+            "reproductive_endocrinology",
+            ["reproductive endocrinology and infertility", "reproductive endocrinology", "rei", "ivf"],
+        ),
+        ("reproductive_medicine", ["reproductive medicine"]),
+        ("gynecologic_oncology", ["gynecologic oncology", "gynaecologic oncology", "gyn oncology"]),
+        (
+            "urogynecology",
+            ["urogynecology", "urogynaecology", "female pelvic medicine", "pelvic medicine"],
+        ),
+        ("minimally_invasive_surgery", ["minimally invasive gynecologic surgery"]),
+        ("family_planning", ["family planning", "complex family planning"]),
+        ("reproductive_health", ["reproductive health"]),
+        ("maternal_fetal_health", ["maternal health", "fetal medicine", "maternal medicine"]),
+        ("prenatal_high_risk", ["prenatal diagnosis", "high-risk pregnancy"]),
+        (
+            "general_obgyn",
+            [
+                "general obstetrics",
+                "general gynecology",
+                "academic specialists in general obstetrics and gynecology",
+            ],
+        ),
+        ("womens_health_center", ["center for women's health", "women's health research"]),
+        ("reproductive_sciences", ["reproductive sciences"]),
+    ],
+}
+
 
 def clean_term(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
@@ -394,6 +665,39 @@ def resolve_discovery_terms(specialty: str, custom_keywords: str = "") -> list[s
     return [term for term in terms if term and not (term in seen or seen.add(term))]
 
 
+def specialty_unit_terms(specialty: str, terms: list[str]) -> list[str]:
+    candidates = list(SPECIALTY_UNIT_TERMS.get(specialty, []))
+    candidates.extend(terms)
+    seen: set[str] = set()
+    return [
+        clean_term(term)
+        for term in candidates
+        if clean_term(term) and not (clean_term(term) in seen or seen.add(clean_term(term)))
+    ]
+
+
+def specialty_unit_groups(
+    specialty: str,
+    terms: list[str],
+) -> list[tuple[str, list[str]]]:
+    requested_terms = specialty_unit_terms(specialty, terms)
+    configured = SPECIALTY_UNIT_GROUPS.get(specialty, [])
+    groups: list[tuple[str, list[str]]] = []
+    covered: set[str] = set()
+    for intent, aliases in configured:
+        cleaned_aliases = [clean_term(alias) for alias in aliases if clean_term(alias)]
+        if cleaned_aliases:
+            groups.append((intent, cleaned_aliases))
+            covered.update(cleaned_aliases)
+    groups.extend((term, [term]) for term in requested_terms if term not in covered)
+    return groups
+
+
+def search_alias_clause(aliases: list[str]) -> str:
+    quoted = [f'"{alias}"' for alias in aliases]
+    return quoted[0] if len(quoted) == 1 else f"({' OR '.join(quoted)})"
+
+
 # ==================================================
 # 3. Data classes
 # ==================================================
@@ -406,6 +710,8 @@ class Institution:
     source_query: str
     score: int
     evidence_url: str = ""
+    additional_hosts: list[str] = field(default_factory=list)
+    additional_evidence_urls: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -415,6 +721,7 @@ class PageCandidate:
     matched_terms: list[str]
     source: str
     score: int
+    classification: str = "UNCLASSIFIED"
 
 
 @dataclass
@@ -435,6 +742,20 @@ class Contact:
     source_url: str
     method: str
     strength: int = 5
+    profile_url: str = ""
+    email_source_url: str = ""
+    relevance_evidence: str = ""
+    confidence: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.email_source_url:
+            self.email_source_url = self.source_url
+        if not self.profile_url and "profile" in self.method.casefold():
+            self.profile_url = self.source_url
+        if not self.relevance_evidence:
+            self.relevance_evidence = self.method
+        if not self.confidence:
+            self.confidence = "HIGH" if self.strength == 0 else "MEDIUM"
 
     def final_row(self) -> dict[str, str]:
         return {"Name": self.name, "Email": self.email}
@@ -474,6 +795,15 @@ class InstitutionReport:
             "Contacts": self.contacts_found,
             "Notes": "; ".join(self.notes[:6]),
         }
+
+
+@dataclass(frozen=True)
+class SpecialtyEvidence:
+    verified: bool
+    regional_program: bool
+    kind: str
+    reason: str
+    confidence: int
 
 
 # ==================================================
@@ -537,8 +867,8 @@ def institution_candidate_host(host: str) -> str:
     generic_subdomains = {
         "academic", "academics", "admissions", "apply", "blog", "catalog",
         "college", "department", "directory", "faculty", "health", "library",
-        "medicine", "med", "news", "nursing", "online", "people", "research",
-        "school", "som", "staff",
+        "libguides", "medicine", "med", "news", "nursing", "online", "people",
+        "portal", "research", "school", "som", "staff",
     }
     generic_subdomains.update(
         clean_term(term).replace("-", "")
@@ -565,6 +895,22 @@ def related_official_domain(url_or_host: str, official_host: str) -> bool:
     if host == official_host or host.endswith("." + official_host):
         return True
     return organization_root(host) == organization_root(official_host)
+
+
+def institution_hosts(institution: Institution) -> list[str]:
+    seen: set[str] = set()
+    return [
+        host
+        for host in [institution.host, *institution.additional_hosts]
+        if host and not (host in seen or seen.add(host))
+    ]
+
+
+def institution_related_domain(url_or_host: str, institution: Institution) -> bool:
+    return any(
+        related_official_domain(url_or_host, host)
+        for host in institution_hosts(institution)
+    )
 
 
 def is_bad_external_source(url: str) -> bool:
@@ -632,6 +978,35 @@ def fetch_html(session: requests.Session, url: str) -> tuple[str | None, str | N
     if "html" not in content_type and not response.text.lstrip().startswith("<"):
         return None, final_url, "Not HTML"
     return response.text, final_url, None
+
+
+def render_dynamic_html(url: str) -> tuple[str | None, str | None, str | None]:
+    if sync_playwright is None:
+        return None, url, "Playwright is not available"
+    try:
+        with sync_playwright() as playwright:
+            browser_paths = (
+                Path("/usr/bin/chromium"),
+                Path("/usr/bin/chromium-browser"),
+                Path("/usr/bin/google-chrome"),
+                Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+                Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+                Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+            )
+            executable = next((path for path in browser_paths if path.exists()), None)
+            launch_options = {"headless": True}
+            if executable:
+                launch_options["executable_path"] = str(executable)
+            browser = playwright.chromium.launch(**launch_options)
+            page = browser.new_page(user_agent=USER_AGENT)
+            page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT * 1000)
+            page.wait_for_timeout(1200)
+            html = page.content()
+            final_url = page.url
+            browser.close()
+            return html, final_url, None
+    except Exception as exc:
+        return None, url, f"Playwright {exc.__class__.__name__}"
 
 
 def is_pdf_url(url: str) -> bool:
@@ -1098,6 +1473,18 @@ def institution_subdomain_prefix(host: str) -> str:
 
 
 def deduplicate_institutions(institutions: Iterable[Institution]) -> list[Institution]:
+    def merge_aliases(target: Institution, source: Institution) -> None:
+        for host in [source.host, *source.additional_hosts]:
+            if host and host != target.host and host not in target.additional_hosts:
+                target.additional_hosts.append(host)
+        for evidence_url in [source.evidence_url, *source.additional_evidence_urls]:
+            if (
+                evidence_url
+                and evidence_url != target.evidence_url
+                and evidence_url not in target.additional_evidence_urls
+            ):
+                target.additional_evidence_urls.append(evidence_url)
+
     by_name: dict[str, Institution] = {}
     for item in institutions:
         if not valid_institution_name(item.name, item.host):
@@ -1106,7 +1493,9 @@ def deduplicate_institutions(institutions: Iterable[Institution]) -> list[Instit
         if not key:
             continue
         existing = by_name.get(key)
-        if not existing or (
+        if not existing:
+            by_name[key] = item
+        elif (
             item.score,
             int(is_academic_domain(item.host)),
             -len(item.official_url),
@@ -1115,7 +1504,10 @@ def deduplicate_institutions(institutions: Iterable[Institution]) -> list[Instit
             int(is_academic_domain(existing.host)),
             -len(existing.official_url),
         ):
+            merge_aliases(item, existing)
             by_name[key] = item
+        else:
+            merge_aliases(existing, item)
     unique_items = list(by_name.values())
     by_domain: dict[str, list[Institution]] = {}
     for item in unique_items:
@@ -1139,7 +1531,42 @@ def deduplicate_institutions(institutions: Iterable[Institution]) -> list[Instit
             )
         else:
             merged.extend(domain_items)
-    return sorted(merged, key=lambda item: (-item.score, item.name.casefold()))
+    primary_candidates = [
+        item
+        for item in merged
+        if any(marker in fold_text(item.name) for marker in ("university", "college", "school"))
+    ]
+    affiliated_units: set[int] = set()
+    unit_markers = (
+        "center", "centre", "institute", "hospital", "health system",
+        "medical center", "medical centre", "clinic", "libguides", "library",
+        "portal",
+    )
+    for child in merged:
+        if not any(marker in fold_text(child.name) for marker in unit_markers):
+            continue
+        child_blob = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            fold_text(f"{child.name} {organization_root(child.host).split('.', 1)[0]}"),
+        )
+        parents = [
+            parent
+            for parent in primary_candidates
+            if parent is not child
+            and len(institution_name_initialism(parent.name)) >= 3
+            and institution_name_initialism(parent.name) in child_blob
+        ]
+        if not parents:
+            continue
+        parent = max(parents, key=lambda item: item.score)
+        merge_aliases(parent, child)
+        affiliated_units.add(id(child))
+
+    return sorted(
+        [item for item in merged if id(item) not in affiliated_units],
+        key=lambda item: (-item.score, item.name.casefold()),
+    )
 
 
 def extract_institution_name(soup: BeautifulSoup, search_title: str, host: str) -> str | None:
@@ -1326,38 +1753,96 @@ def official_location_pages_match(
         return any(executor.map(check_page, sorted(urls)))
 
 
-def specialty_program_evidence(
+def classify_specialty_program_evidence(
     text: str,
     region: str,
     terms: list[str],
-) -> tuple[bool, bool]:
-    folded = fold_text(text)
-    direct_terms = [fold_text(term) for term in terms if fold_text(term)]
-    specialty_markers = (
-        "department", "division", "faculty", "program", "curriculum",
-        "school of", "college of", "residency", "fellowship", "clerkship",
-        "course", "training", "research",
+) -> SpecialtyEvidence:
+    folded = re.sub(r"[^a-z0-9]+", " ", fold_text(text))
+    direct_terms = [
+        re.sub(r"[^a-z0-9]+", " ", fold_text(term)).strip()
+        for term in terms
+        if fold_text(term)
+    ]
+    direct_terms = list(dict.fromkeys(term for term in direct_terms if term))
+    if not folded or not direct_terms:
+        return SpecialtyEvidence(False, False, "none", "No specialty terms supplied", 0)
+
+    primary = direct_terms[0]
+    primary_aliases = {
+        primary,
+        *(
+            term
+            for term in direct_terms
+            if len(re.sub(r"[^a-z0-9]", "", term)) <= 8
+        ),
+    }
+    unit_markers = (
+        "department", "division", "section", "center", "centre",
+        "institute", "faculty", "academic unit", "research group",
+    )
+    academic_markers = (
+        "faculty", "professor", "academic", "teaching", "research",
+        "chair", "division chief", "program director", "medical education",
+        "school of medicine", "college of medicine", "medical school",
+        "residency", "fellowship", "clerkship", "medical students",
+    )
+    medical_identity_markers = (
+        "school of medicine", "college of medicine", "medical school",
+        "osteopathic medicine", "medical students", "medical education",
+        "clinical education", "doctor of medicine", "doctor of osteopathic medicine",
+    )
+    required_training_markers = (
+        "required clerkship", "core clerkship", "clinical clerkship",
+        "clerkship", "clinical rotation", "core rotation", "third year",
+        "third-year", "fourth year", "fourth-year", "clinical curriculum",
+    )
+    exact_program_markers = (
+        "residency program", "fellowship program", "academic program",
+        "graduate medical education",
     )
     regional_markers = (
         "partnership", "pathway", "regional campus", "clinical site",
         "training site", "teaching site", "clerkship", "clinical rotation",
         "medical education", "students spend", "campus",
     )
-    specialty_verified = False
+
+    matched_kind = "none"
+    matched_reason = "Specialty mentioned without direct academic-unit or medical-training evidence"
+    confidence = 0
     for term in direct_terms:
         start = 0
         while (position := folded.find(term, start)) >= 0:
-            context = folded[max(0, position - 700): position + len(term) + 700]
-            if any(marker in context for marker in specialty_markers):
-                specialty_verified = True
+            context = folded[max(0, position - 900): position + len(term) + 900]
+            local_context = folded[max(0, position - 360): position + len(term) + 360]
+            has_unit = any(marker in local_context for marker in unit_markers)
+            has_academic_role = any(marker in local_context for marker in academic_markers)
+            has_medical_identity = any(marker in context for marker in medical_identity_markers)
+            has_required_training = any(marker in context for marker in required_training_markers)
+            has_exact_program = any(marker in context for marker in exact_program_markers)
+
+            if has_unit and has_academic_role:
+                matched_kind = "academic_unit"
+                matched_reason = f"Direct academic specialty unit or faculty evidence for {term}"
+                confidence = 100
+                break
+            if term in primary_aliases and has_medical_identity and has_required_training:
+                matched_kind = "medical_training"
+                matched_reason = f"Required medical-school specialty training evidence for {term}"
+                confidence = 90
+                break
+            if term in primary_aliases and has_medical_identity and has_exact_program:
+                matched_kind = "academic_program"
+                matched_reason = f"Direct academic specialty program evidence for {term}"
+                confidence = 90
                 break
             start = position + len(term)
-        if specialty_verified:
+        if matched_kind != "none":
             break
 
     regional_program = False
-    region_term = fold_text(region)
-    if specialty_verified and region_term:
+    region_term = re.sub(r"[^a-z0-9]+", " ", fold_text(region)).strip()
+    if matched_kind != "none" and region_term:
         regional_place_words = (
             "campus", "clinical site", "training site", "teaching site",
             "medical center", "medical centre", "hospital", "clinic",
@@ -1380,7 +1865,44 @@ def specialty_program_evidence(
             ):
                 regional_program = True
                 break
-    return specialty_verified, regional_program
+    return SpecialtyEvidence(
+        matched_kind != "none",
+        regional_program,
+        matched_kind,
+        matched_reason,
+        confidence,
+    )
+
+
+def specialty_program_evidence(
+    text: str,
+    region: str,
+    terms: list[str],
+) -> tuple[bool, bool]:
+    evidence = classify_specialty_program_evidence(text, region, terms)
+    return evidence.verified, evidence.regional_program
+
+
+def official_source_specialty_evidence_details(
+    source_url: str,
+    official_host: str,
+    region: str,
+    terms: list[str],
+) -> SpecialtyEvidence:
+    normalized = normalize_url(source_url)
+    if not normalized or not related_official_domain(normalized, official_host):
+        return SpecialtyEvidence(False, False, "none", "Not an official institutional URL", 0)
+    source_session = make_session()
+    if is_pdf_url(normalized):
+        text, error = fetch_pdf_text(source_session, normalized)
+        if error or not text:
+            return SpecialtyEvidence(False, False, "none", error or "Unreadable official PDF", 0)
+        return classify_specialty_program_evidence(text, region, terms)
+    html, final_url, _ = fetch_html(source_session, normalized)
+    if not html or not final_url or not related_official_domain(final_url, official_host):
+        return SpecialtyEvidence(False, False, "none", "Official evidence page unavailable", 0)
+    soup = BeautifulSoup(html, "html.parser")
+    return classify_specialty_program_evidence(soup.get_text(" ", strip=True), region, terms)
 
 
 def official_source_specialty_evidence(
@@ -1389,20 +1911,13 @@ def official_source_specialty_evidence(
     region: str,
     terms: list[str],
 ) -> tuple[bool, bool]:
-    normalized = normalize_url(source_url)
-    if not normalized or not related_official_domain(normalized, official_host):
-        return False, False
-    source_session = make_session()
-    if is_pdf_url(normalized):
-        text, error = fetch_pdf_text(source_session, normalized)
-        if error or not text:
-            return False, False
-        return specialty_program_evidence(text, region, terms)
-    html, final_url, _ = fetch_html(source_session, normalized)
-    if not html or not final_url or not related_official_domain(final_url, official_host):
-        return False, False
-    soup = BeautifulSoup(html, "html.parser")
-    return specialty_program_evidence(soup.get_text(" ", strip=True), region, terms)
+    evidence = official_source_specialty_evidence_details(
+        source_url,
+        official_host,
+        region,
+        terms,
+    )
+    return evidence.verified, evidence.regional_program
 
 
 def canonical_institution_url(raw_url: str) -> str | None:
@@ -1445,7 +1960,11 @@ def discover_institutions(
     log: list[str] = []
     search_region = search_region_for_country(country_code)
     executed_queries: set[str] = set()
-    refined_roots: dict[str, set[str]] = {"faculty": set(), "curriculum": set()}
+    refined_roots: dict[str, set[str]] = {
+        "faculty": set(),
+        "curriculum": set(),
+        "training": set(),
+    }
 
     def add_search_result(
         search: PlannedSearch,
@@ -1585,10 +2104,26 @@ def discover_institutions(
         for root in roots:
             if intent == "faculty":
                 query = f'site:{root} ({term_query}) (department OR faculty OR "faculty directory")'
-            else:
+            elif intent == "curriculum":
                 query = (
                     f'site:{root} ({term_query}) '
                     '(curriculum OR clerkship OR "clinical rotation" OR teaching)'
+                )
+            else:
+                primary = discovery_terms[0] if discovery_terms else specialty
+                short_aliases = [
+                    term
+                    for term in discovery_terms
+                    if len(re.sub(r"[^a-z0-9]", "", term.casefold())) <= 8
+                ]
+                focused_terms = [primary, *short_aliases]
+                focused_query = " OR ".join(
+                    f'"{term}"' for term in dict.fromkeys(focused_terms)
+                )
+                query = (
+                    f'site:{root} ({focused_query}) '
+                    '("required clerkship" OR "clinical rotation" OR curriculum '
+                    'OR "clinical education" OR "third year")'
                 )
             searches.append(PlannedSearch(query, "refine", intent))
             targets_by_query[query] = root
@@ -1600,6 +2135,7 @@ def discover_institutions(
     collect_round(initial_searches)
     refine_missing_specialty("faculty")
     refine_missing_specialty("curriculum")
+    refine_missing_specialty("training")
 
     core_coverage_intents = {
         "clerkship", "required_clerkship", "partnership", "regional_teaching",
@@ -1613,6 +2149,7 @@ def discover_institutions(
     collect_round(core_coverage)
     refine_missing_specialty("faculty")
     refine_missing_specialty("curriculum")
+    refine_missing_specialty("training")
 
     has_specialty_roots = any(
         any(payload[2]["specialty_evidence"] == "1" for payload in payloads.values())
@@ -1628,6 +2165,7 @@ def discover_institutions(
         collect_round(remaining_coverage)
         refine_missing_specialty("faculty")
         refine_missing_specialty("curriculum")
+        refine_missing_specialty("training")
     else:
         log.append("[coverage] Extended searches skipped because evidence gaps converged.")
 
@@ -1671,30 +2209,32 @@ def discover_institutions(
             return root, None, message
         def check_evidence(
             payload: tuple[int, str, dict[str, str]],
-        ) -> tuple[tuple[int, str, dict[str, str]], bool, bool]:
+        ) -> tuple[tuple[int, str, dict[str, str]], SpecialtyEvidence]:
             payload_result = payload[2]
-            specialty_match, regional_match = official_source_specialty_evidence(
+            evidence = official_source_specialty_evidence_details(
                 payload_result["url"],
                 host_of(payload_result["url"]),
                 region,
                 discovery_terms,
             )
-            return payload, specialty_match, regional_match
+            return payload, evidence
 
         with ThreadPoolExecutor(max_workers=min(6, len(eligible_payloads) or 1)) as executor:
             evidence_checks = list(executor.map(check_evidence, eligible_payloads))
-        verified_evidence = [item for item in evidence_checks if item[1]]
+        verified_evidence = [item for item in evidence_checks if item[1].verified]
         if not verified_evidence:
             message = f"Rejected {candidate_url}: official source did not verify {specialty} teaching or training"
             return root, None, message
-        evidence_payload, _, regional_program_verified = max(
+        evidence_payload, evidence_details = max(
             verified_evidence,
             key=lambda item: (
-                int(item[2]),
+                item[1].confidence,
+                int(item[1].regional_program),
                 int(item[0][2].get("region_evidence") == "1"),
                 item[0][0],
             ),
         )
+        regional_program_verified = evidence_details.regional_program
         evidence_score, evidence_query, evidence_result = evidence_payload
         score = max(score, evidence_score)
         query = evidence_query
@@ -1744,7 +2284,10 @@ def discover_institutions(
             score=score,
             evidence_url=evidence_result["url"],
         )
-        return root, item, f"Accepted {name}: {candidate_url} (specialty evidence: {evidence_result['url']})"
+        return root, item, (
+            f"Accepted {name}: {candidate_url} "
+            f"({evidence_details.kind}: {evidence_result['url']})"
+        )
 
     grouped_candidates = [
         (root, list(payloads.values()))
@@ -1784,6 +2327,47 @@ def relevance_score(url: str, title: str, page_text: str, terms: list[str]) -> i
     if any(word in combined for word in ("faculty", "people", "directory", "profile")):
         score += 18
     return score
+
+
+PAGE_CLASSIFICATIONS = {
+    "DEPARTMENT",
+    "DIVISION",
+    "FACULTY_DIRECTORY",
+    "PERSON_PROFILE",
+    "CENTER",
+    "HOSPITAL_PROVIDER",
+    "SEARCH_RESULT",
+    "IRRELEVANT",
+}
+
+
+def classify_official_page(
+    url: str,
+    title: str,
+    page_text: str,
+    html: str = "",
+) -> str:
+    path = urlparse(url).path.casefold()
+    header = fold_text(f"{title} {page_text[:1800]}")
+    structured = fold_text(html[:12000])
+    if (
+        '"@type":"person"' in structured.replace(" ", "")
+        or any(marker in path for marker in ("/profile/", "/profiles/", "/person/", "/provider/"))
+    ):
+        return "PERSON_PROFILE"
+    if any(marker in header for marker in ("faculty directory", "our faculty", "faculty staff", "our team")):
+        return "FACULTY_DIRECTORY"
+    if "division" in header or "/division" in path:
+        return "DIVISION"
+    if any(marker in header for marker in ("center for", "centre for", "research center", "research centre")):
+        return "CENTER"
+    if "department" in header or "/department" in path:
+        return "DEPARTMENT"
+    if any(marker in header for marker in ("find a provider", "find a doctor", "physician profile")):
+        return "HOSPITAL_PROVIDER"
+    if any(marker in header for marker in ("faculty", "professor", "researcher", "physician")):
+        return "FACULTY_DIRECTORY"
+    return "IRRELEVANT"
 
 
 def extract_sitemap_urls(xml_text: str) -> list[str]:
@@ -1911,6 +2495,15 @@ def build_department_query_plan(
                 ),
             ]
         )
+    for unit_intent, unit_aliases in specialty_unit_groups(specialty, terms):
+        searches.append(
+            PlannedSearch(
+                f"site:{host} {search_alias_clause(unit_aliases)} "
+                '(faculty OR people OR physicians OR researchers OR directory)',
+                "units",
+                unit_intent,
+            )
+        )
     seen: set[str] = set()
     return [search for search in searches if not (search.query in seen or seen.add(search.query))]
 
@@ -1969,6 +2562,9 @@ def site_search_department_urls(
     observed_signals = collect(
         [search for search in query_plan if search.phase == "department"]
     )
+    observed_signals.update(
+        collect([search for search in query_plan if search.phase == "units"])
+    )
     if "email" not in observed_signals:
         observed_signals.update(
             collect([search for search in query_plan if search.phase == "contact"])
@@ -1976,6 +2572,149 @@ def site_search_department_urls(
     if "document" not in observed_signals and not {"faculty", "email"}.issubset(observed_signals):
         collect([search for search in query_plan if search.phase == "documents"])
     return results
+
+
+def build_faculty_audit_query_plan(
+    host: str,
+    specialty: str,
+    terms: list[str],
+    compact: bool = False,
+) -> list[PlannedSearch]:
+    unit_groups = specialty_unit_groups(specialty, terms)
+    if compact:
+        clauses = [search_alias_clause(aliases) for _, aliases in unit_groups]
+        searches = [
+            PlannedSearch(
+                f"site:{host} ({' OR '.join(chunk)}) "
+                '(professor OR faculty OR physician OR researcher OR "program director") -jobs',
+                "audit",
+                f"affiliate_units_{index // 4 + 1}",
+            )
+            for index in range(0, len(clauses), 4)
+            for chunk in [clauses[index:index + 4]]
+        ]
+    else:
+        searches = [
+            PlannedSearch(
+                f"site:{host} {search_alias_clause(unit_aliases)} "
+                '(professor OR faculty OR physician OR researcher OR "program director") -jobs',
+                "audit",
+                unit_intent,
+            )
+            for unit_intent, unit_aliases in unit_groups
+        ]
+    searches.extend(
+        [
+            PlannedSearch(
+                f'site:{host} "{specialty}" residency faculty',
+                "audit",
+                "residency_faculty",
+            ),
+            PlannedSearch(
+                f'site:{host} "{specialty}" fellowship faculty',
+                "audit",
+                "fellowship_faculty",
+            ),
+            PlannedSearch(
+                f'site:{host} "{specialty}" research faculty',
+                "audit",
+                "research_faculty",
+            ),
+        ]
+    )
+    seen: set[str] = set()
+    return [search for search in searches if not (search.query in seen or seen.add(search.query))]
+
+
+def discover_second_pass_pages(
+    institution: Institution,
+    specialty: str,
+    terms: list[str],
+    existing_urls: Iterable[str],
+    disallowed_paths: list[str],
+    country_code: str = "",
+) -> tuple[list[PageCandidate], dict[str, str], list[str]]:
+    searches = [
+        search
+        for host_index, host in enumerate(institution_hosts(institution))
+        for search in build_faculty_audit_query_plan(
+            host,
+            specialty,
+            terms,
+            compact=host_index > 0,
+        )
+    ]
+    existing = {normalize_url(url) for url in existing_urls}
+    discovered: dict[str, tuple[PlannedSearch, dict[str, str]]] = {}
+    log: list[str] = []
+    for search, results in execute_search_round(
+        searches,
+        search_region_for_country(country_code),
+    ):
+        accepted = 0
+        for item in results:
+            normalized = normalize_url(item.get("url", ""))
+            if (
+                not normalized
+                or normalized in existing
+                or not institution_related_domain(normalized, institution)
+                or not path_allowed(normalized, disallowed_paths)
+            ):
+                continue
+            discovered.setdefault(normalized, (search, item))
+            accepted += 1
+        log.append(
+            f"[audit/{search.intent}] {search.query}: "
+            f"{len(results)} result(s), {accepted} new official URL(s)"
+        )
+
+    def verify_page(
+        payload: tuple[str, tuple[PlannedSearch, dict[str, str]]],
+    ) -> tuple[PageCandidate | None, str, str]:
+        url, (search, item) = payload
+        session = make_session()
+        if is_pdf_url(url):
+            text, error = fetch_pdf_text(session, url)
+            if not text:
+                return None, "", f"Rejected {url}: {error or 'unreadable PDF'}"
+            evidence = classify_specialty_program_evidence(text, "", terms)
+            classification = "FACULTY_DIRECTORY" if "faculty" in fold_text(text[:2500]) else "SEARCH_RESULT"
+            html = ""
+            title = clean_text(item.get("title", ""))
+        else:
+            html, final_url, error = fetch_html(session, url)
+            if not html or not final_url:
+                return None, "", f"Rejected {url}: {error or 'unavailable'}"
+            if not institution_related_domain(final_url, institution):
+                return None, "", f"Rejected {url}: left the official domain"
+            url = final_url
+            soup = BeautifulSoup(html, "html.parser")
+            title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else item.get("title", ""))
+            text = clean_text(soup.get_text(" ", strip=True))
+            evidence = classify_specialty_program_evidence(text, "", terms)
+            classification = classify_official_page(url, title, text, html)
+
+        matched = text_matches_terms(f"{url} {title} {text[:4000]}", terms)
+        if not matched:
+            return None, "", f"Rejected {url}: no specialty evidence in official content"
+        if classification == "IRRELEVANT":
+            return None, "", f"Rejected {url}: classified as IRRELEVANT"
+        if not evidence.verified and classification not in {"FACULTY_DIRECTORY", "PERSON_PROFILE"}:
+            return None, "", f"Rejected {url}: {evidence.reason}"
+        score = relevance_score(url, title, text, terms) + evidence.confidence
+        page = PageCandidate(url, title, matched, "second_pass_audit", score, classification)
+        return page, html, f"Accepted {url}: {classification} ({search.intent})"
+
+    pages: dict[str, PageCandidate] = {}
+    page_cache: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(discovered) or 1)) as executor:
+        for page, html, message in executor.map(verify_page, discovered.items()):
+            log.append(message)
+            if page:
+                pages[page.url] = page
+                if html:
+                    page_cache[page.url] = html
+    return sorted(pages.values(), key=lambda page: (-page.score, page.url)), page_cache, log
 
 
 def discover_department_pages(
@@ -2018,7 +2757,7 @@ def discover_department_pages(
 
     def add_candidate(url: str, title: str, source: str, page_text: str = "") -> None:
         normalized = normalize_url(url)
-        if not normalized or not related_official_domain(normalized, official_host):
+        if not normalized or not institution_related_domain(normalized, institution):
             return
         if not path_allowed(normalized, disallowed_paths):
             return
@@ -2092,7 +2831,15 @@ def discover_department_pages(
             score = max(score, 25)
         if score <= 0:
             return
-        item = PageCandidate(normalized, clean_text(title), matched, source, score)
+        classification = classify_official_page(normalized, title, page_text)
+        item = PageCandidate(
+            normalized,
+            clean_text(title),
+            matched,
+            source,
+            score,
+            classification,
+        )
         existing = candidates.get(normalized)
         if not existing or item.score > existing.score:
             candidates[normalized] = item
@@ -2118,7 +2865,7 @@ def discover_department_pages(
         if (
             evidence_html
             and evidence_final_url
-            and related_official_domain(evidence_final_url, official_host)
+            and institution_related_domain(evidence_final_url, institution)
         ):
             evidence_soup = BeautifulSoup(evidence_html, "html.parser")
             evidence_title = clean_text(
@@ -2209,14 +2956,15 @@ def discover_department_pages(
         ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
         return ordered, log, page_cache
 
-    for item in site_search_department_urls(
-        official_host,
-        region,
-        specialty,
-        terms,
-        search_region_for_country(country_code),
-    ):
-        add_candidate(item["url"], item.get("title", ""), "site_search", item.get("body", ""))
+    for search_host in institution_hosts(institution):
+        for item in site_search_department_urls(
+            search_host,
+            region,
+            specialty,
+            terms,
+            search_region_for_country(country_code),
+        ):
+            add_candidate(item["url"], item.get("title", ""), "site_search", item.get("body", ""))
     log.append("Official-site search checked.")
 
     if verified_evidence_seed:
@@ -2284,7 +3032,7 @@ def discover_department_pages(
     for candidate_url, html, final_candidate in common_results:
         if not html or not final_candidate:
             continue
-        if not related_official_domain(final_candidate, official_host):
+        if not institution_related_domain(final_candidate, institution):
             continue
         soup = BeautifulSoup(html, "html.parser")
         title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
@@ -2323,10 +3071,24 @@ def find_pagination_links(soup: BeautifulSoup, base_url: str) -> list[str]:
     for anchor in soup.find_all("a", href=True):
         text = clean_text(anchor.get_text(" ", strip=True)).lower()
         aria = clean_text(anchor.get("aria-label", "")).lower()
-        if text.isdigit() or text in NEXT_LINK_WORDS or aria in NEXT_LINK_WORDS or "next" in aria:
-            target = normalize_url(urljoin(base_url, anchor.get("href", "")))
-            if target and target != normalize_url(base_url):
-                found[target] = None
+        target = normalize_url(urljoin(base_url, anchor.get("href", "")))
+        if not target or target == normalize_url(base_url):
+            continue
+        pagination_parent = anchor.find_parent(
+            attrs={
+                "class": re.compile(r"pag(?:e|ination)|pager", re.I),
+            }
+        )
+        numeric_page_url = bool(
+            re.search(r"(?:[?&](?:page|start|offset)=\d+|/page/\d+(?:/|$))", target, flags=re.I)
+        )
+        if (
+            text in NEXT_LINK_WORDS
+            or aria in NEXT_LINK_WORDS
+            or "next" in aria
+            or (text.isdigit() and (pagination_parent or numeric_page_url))
+        ):
+            found[target] = None
     return list(found.keys())
 
 
@@ -2343,10 +3105,15 @@ def should_follow_faculty_link(
     terms: list[str],
 ) -> bool:
     combined = f"{target_url} {link_text}".lower()
-    if text_matches_terms(combined, terms):
-        return True
     if looks_like_profile_url(target_url, link_text):
         return False
+    academic_link_markers = (
+        "department", "division", "faculty", "people", "directory", "team",
+        "leadership", "center", "centre", "institute", "research", "residency",
+        "fellowship", "provider", "physician",
+    )
+    if text_matches_terms(combined, terms):
+        return any(marker in combined for marker in academic_link_markers)
     if not source_has_department_terms or not any(word in combined for word in FACULTY_PAGE_WORDS):
         return False
     source_parts = {part for part in urlparse(source_url).path.lower().split("/") if len(part) >= 4}
@@ -2381,6 +3148,11 @@ def looks_like_profile_url(url: str, link_text: str = "") -> bool:
     ):
         return False
     if any(bad in combined for bad in ("browse?", "search?", "filter=", "page=", "department=")):
+        return False
+    path_parts = [part for part in urlparse(lowered_url).path.split("/") if part]
+    if path_parts and path_parts[-1] in {
+        "faculty", "people", "person", "profiles", "providers", "staff", "directory",
+    }:
         return False
     return True
 
@@ -2791,9 +3563,10 @@ def discover_faculty_roster(
     disallowed_paths: list[str],
     seed_cache: dict[str, str] | None = None,
 ) -> tuple[list[FacultyEntry], list[str], list[Rejection], dict[str, str], list[str], list[str]]:
-    session = make_session()
-    queue: deque[str] = deque(page.url for page in department_pages)
+    queue: deque[str] = deque()
+    scheduled: set[str] = set()
     visited: set[str] = set()
+    seen_content: set[tuple[int, str, str]] = set()
     roster: dict[str, FacultyEntry] = {}
     faculty_pages: list[str] = []
     rejections: list[Rejection] = []
@@ -2801,84 +3574,136 @@ def discover_faculty_roster(
     log: list[str] = []
     blocked: list[str] = []
 
-    while queue:
-        raw_url = queue.popleft()
+    def enqueue(raw_url: str) -> None:
         normalized = normalize_url(raw_url)
-        if not normalized or normalized in visited:
-            continue
-        if not related_official_domain(normalized, institution.host):
-            continue
+        if not normalized or normalized in scheduled:
+            return
+        if not institution_related_domain(normalized, institution):
+            return
         if not path_allowed(normalized, disallowed_paths):
             log.append(f"Skipped by robots.txt: {normalized}")
-            continue
-        visited.add(normalized)
+            return
+        scheduled.add(normalized)
+        queue.append(normalized)
 
-        if is_pdf_url(normalized):
-            faculty_pages.append(normalized)
-            continue
+    for page in department_pages:
+        enqueue(page.url)
 
-        html = page_cache.get(normalized)
-        final_url = normalized
-        if html is None:
-            html, final_url, error = fetch_html(session, normalized)
-            if not html or not final_url:
-                blocked.append(f"{normalized}: {error or 'unavailable'}")
-                continue
-            if not related_official_domain(final_url, institution.host):
-                continue
-            page_cache[final_url] = html
-
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "nav", "footer", "form"]):
-            tag.decompose()
-        title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
-        page_text = clean_text(soup.get_text(" ", strip=True))
-        combined_header = f"{final_url} {title}".lower()
-        if any(word in combined_header for word in FACULTY_PAGE_WORDS):
-            faculty_pages.append(final_url)
-
-        if page_has_js_only_signals(soup, page_text):
-            log.append(f"Possible JavaScript-only directory: {final_url}")
-
-        if text_matches_terms(f"{final_url} {title} {page_text}", terms):
-            found_entries, found_rejections = extract_roster_entries_from_soup(final_url, soup)
-            department_scoped = page_is_department_scoped(final_url, title, terms)
-            for entry in found_entries:
-                if department_scoped or text_matches_terms(entry.evidence, terms):
-                    roster.setdefault(entry.normalized_name, entry)
-                else:
-                    rejections.append(
-                        Rejection(entry.name, "Outside requested department", final_url, entry.title)
-                    )
-            rejections.extend(found_rejections)
-
-        is_faculty_listing = any(word in combined_header for word in FACULTY_PAGE_WORDS)
-        if is_faculty_listing:
-            for page_link in find_pagination_links(soup, final_url):
-                if page_link not in visited and related_official_domain(page_link, institution.host):
-                    queue.append(page_link)
-
-        for anchor in soup.find_all("a", href=True):
-            link = normalize_url(urljoin(final_url, anchor.get("href", "")))
-            if not link or link in visited:
-                continue
-            if not related_official_domain(link, institution.host):
-                continue
-            if not path_allowed(link, disallowed_paths):
-                continue
-            link_text = clean_text(anchor.get_text(" ", strip=True))
-            if should_follow_faculty_link(
-                final_url,
-                link,
-                link_text,
-                bool(text_matches_terms(f"{final_url} {title} {page_text}", terms)),
-                terms,
-            ):
-                queue.append(link)
-
-        log.append(f"[{len(visited)} checked] {final_url}")
+    def fetch_page(normalized: str) -> tuple[str, str | None, str | None, str | None]:
+        cached = page_cache.get(normalized)
+        if cached is not None:
+            return normalized, cached, normalized, None
+        page_session = make_session()
+        html, final_url, error = fetch_html(page_session, normalized)
         if delay_seconds > 0:
             time.sleep(delay_seconds)
+        return normalized, html, final_url, error
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        while queue:
+            batch: list[str] = []
+            while queue and len(batch) < 18:
+                normalized = queue.popleft()
+                if normalized in visited:
+                    continue
+                visited.add(normalized)
+                if is_pdf_url(normalized):
+                    faculty_pages.append(normalized)
+                    continue
+                batch.append(normalized)
+
+            if not batch:
+                continue
+
+            for normalized, html, final_url, error in executor.map(fetch_page, batch):
+                if not html or not final_url:
+                    blocked.append(f"{normalized}: {error or 'unavailable'}")
+                    continue
+                if not institution_related_domain(final_url, institution):
+                    continue
+                final_normalized = normalize_url(final_url)
+                if final_normalized:
+                    visited.add(final_normalized)
+                    scheduled.add(final_normalized)
+                page_cache[final_url] = html
+
+                raw_soup = BeautifulSoup(html, "html.parser")
+                raw_text = clean_text(raw_soup.get_text(" ", strip=True))
+                raw_title = clean_text(
+                    raw_soup.title.get_text(" ", strip=True) if raw_soup.title else ""
+                )
+                dynamic_identity = fold_text(f"{final_url} {raw_title}")
+                dynamic_directory = any(
+                    marker in dynamic_identity
+                    for marker in (
+                        "faculty", "people", "directory", "provider", "physician", "our team",
+                    )
+                )
+                if dynamic_directory and page_has_js_only_signals(raw_soup, raw_text):
+                    rendered_html, rendered_url, render_error = render_dynamic_html(final_url)
+                    if (
+                        rendered_html
+                        and rendered_url
+                        and institution_related_domain(rendered_url, institution)
+                    ):
+                        html = rendered_html
+                        final_url = rendered_url
+                        page_cache[final_url] = html
+                        log.append(f"Rendered JavaScript directory: {final_url}")
+                    else:
+                        log.append(
+                            f"Possible JavaScript-only directory: {final_url} "
+                            f"({render_error or 'rendering unavailable'})"
+                        )
+
+                content_key = (len(html), html[:800], html[-800:])
+                if content_key in seen_content:
+                    log.append(f"Duplicate official mirror skipped: {final_url}")
+                    continue
+                seen_content.add(content_key)
+
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup(["script", "style", "noscript", "nav", "footer", "form"]):
+                    tag.decompose()
+                title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+                page_text = clean_text(soup.get_text(" ", strip=True))
+                combined_header = f"{final_url} {title}".lower()
+                if any(word in combined_header for word in FACULTY_PAGE_WORDS):
+                    faculty_pages.append(final_url)
+
+                page_has_terms = bool(text_matches_terms(f"{final_url} {title} {page_text}", terms))
+                if page_has_terms:
+                    found_entries, found_rejections = extract_roster_entries_from_soup(final_url, soup)
+                    department_scoped = page_is_department_scoped(final_url, title, terms)
+                    for entry in found_entries:
+                        if department_scoped or text_matches_terms(entry.evidence, terms):
+                            roster.setdefault(entry.normalized_name, entry)
+                        else:
+                            rejections.append(
+                                Rejection(entry.name, "Outside requested department", final_url, entry.title)
+                            )
+                    rejections.extend(found_rejections)
+
+                is_faculty_listing = any(word in combined_header for word in FACULTY_PAGE_WORDS)
+                if is_faculty_listing:
+                    for page_link in find_pagination_links(soup, final_url):
+                        enqueue(page_link)
+
+                for anchor in soup.find_all("a", href=True):
+                    link = normalize_url(urljoin(final_url, anchor.get("href", "")))
+                    if not link:
+                        continue
+                    link_text = clean_text(anchor.get_text(" ", strip=True))
+                    if should_follow_faculty_link(
+                        final_url,
+                        link,
+                        link_text,
+                        page_has_terms,
+                        terms,
+                    ):
+                        enqueue(link)
+
+                log.append(f"[{len(visited)} checked] {final_url}")
 
     return list(roster.values()), sorted(set(faculty_pages)), rejections, page_cache, log, blocked
 
@@ -2924,7 +3749,7 @@ def filter_roster_to_location(
 
 def discover_profile_links(
     page_cache: dict[str, str],
-    institution_host: str,
+    institution: Institution,
     roster_entries: list[FacultyEntry],
 ) -> list[dict[str, object]]:
     roster_names = {entry.normalized_name for entry in roster_entries}
@@ -2934,7 +3759,7 @@ def discover_profile_links(
         for anchor in soup.find_all("a", href=True):
             target = normalize_url(urljoin(page_url, anchor.get("href", "")))
             text = clean_text(anchor.get_text(" ", strip=True))
-            if not target or not related_official_domain(target, institution_host):
+            if not target or not institution_related_domain(target, institution):
                 continue
             if not looks_like_profile_url(target, text):
                 continue
@@ -3063,10 +3888,37 @@ def classify_email(
     return True, None
 
 
+def classify_institution_email(
+    email: str,
+    institution: Institution,
+    allow_published_affiliate: bool = False,
+) -> tuple[bool, str | None]:
+    reasons: list[str] = []
+    for official_host in institution_hosts(institution):
+        accepted, reason = classify_email(
+            email,
+            official_host,
+            allow_published_affiliate=allow_published_affiliate,
+        )
+        if accepted:
+            return True, None
+        if reason:
+            reasons.append(reason)
+    if reasons and all(reason == "Outside official domain family" for reason in reasons):
+        return False, "Outside official domain family"
+    return False, reasons[0] if reasons else "Outside official domain family"
+
+
 def is_verified_evidence_page(source_url: str, institution: Institution) -> bool:
     source = normalize_url(source_url)
-    evidence = normalize_url(institution.evidence_url)
-    return bool(source and evidence and source.rstrip("/") == evidence.rstrip("/"))
+    if not source:
+        return False
+    evidence_urls = [institution.evidence_url, *institution.additional_evidence_urls]
+    return any(
+        evidence
+        and source.rstrip("/") == evidence.rstrip("/")
+        for evidence in (normalize_url(url) for url in evidence_urls)
+    )
 
 
 def is_admin_context(text: str) -> bool:
@@ -3481,7 +4333,7 @@ def parse_profile_page(
         if not is_displayed_contact(occurrences):
             rejections.append(Rejection(display_name, "Email not shown as a contact field", url, email))
             continue
-        ok, reason = classify_email(email, institution.host)
+        ok, reason = classify_institution_email(email, institution)
         if ok:
             contacts.append(Contact(display_name, email, institution.name, url, "Official personal profile", 0))
         elif reason:
@@ -3546,7 +4398,7 @@ def parse_public_profile_payload(
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
     for email in sorted(raw_emails):
-        ok, reason = classify_email(email, institution.host)
+        ok, reason = classify_institution_email(email, institution)
         if ok:
             contacts.append(Contact(display_name, email, institution.name, profile_url, "Official public profile API", 0))
         elif reason:
@@ -3563,22 +4415,24 @@ def crawl_profiles(
     delay_seconds: float,
     disallowed_paths: list[str],
 ) -> tuple[list[Contact], list[Rejection], list[str], list[str]]:
-    session = make_session()
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
     log: list[str] = []
     blocked: list[str] = []
-    for index, link in enumerate(profile_links, start=1):
+
+    def inspect_profile(
+        payload: tuple[int, dict[str, object]],
+    ) -> tuple[list[Contact], list[Rejection], str, str | None]:
+        index, link = payload
         url = str(link["url"])
         if not path_allowed(url, disallowed_paths):
-            log.append(f"Skipped by robots.txt: {url}")
-            continue
+            return [], [], f"Skipped by robots.txt: {url}", None
+        session = make_session()
         html, final_url, error = fetch_html(session, url)
         if not html or not final_url:
-            blocked.append(f"{url}: {error or 'unavailable'}")
-            continue
-        if not related_official_domain(final_url, institution.host):
-            continue
+            return [], [], "", f"{url}: {error or 'unavailable'}"
+        if not institution_related_domain(final_url, institution):
+            return [], [], "", None
         found_contacts, found_rejections = parse_profile_page(final_url, html, institution, roster_entries)
         if not found_contacts:
             payload, payload_error = fetch_public_profile_payload(session, final_url, html)
@@ -3592,12 +4446,32 @@ def crawl_profiles(
                 found_contacts.extend(api_contacts)
                 found_rejections.extend(api_rejections)
             elif payload_error:
-                blocked.append(f"{final_url}: {payload_error}")
-        contacts.extend(found_contacts)
-        rejections.extend(found_rejections)
-        log.append(f"{final_url}: {len(found_contacts)} contact(s)")
+                if delay_seconds > 0 and index < len(profile_links):
+                    time.sleep(delay_seconds)
+                return (
+                    found_contacts,
+                    found_rejections,
+                    f"{final_url}: {len(found_contacts)} contact(s)",
+                    f"{final_url}: {payload_error}",
+                )
         if delay_seconds > 0 and index < len(profile_links):
             time.sleep(delay_seconds)
+        return (
+            found_contacts,
+            found_rejections,
+            f"{final_url}: {len(found_contacts)} contact(s)",
+            None,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(8, len(profile_links) or 1)) as executor:
+        results = executor.map(inspect_profile, enumerate(profile_links, start=1))
+        for found_contacts, found_rejections, message, blocked_message in results:
+            contacts.extend(found_contacts)
+            rejections.extend(found_rejections)
+            if message:
+                log.append(message)
+            if blocked_message:
+                blocked.append(blocked_message)
     return contacts, rejections, log, blocked
 
 
@@ -3640,9 +4514,9 @@ def extract_card_level_contacts(
             emails = emails_in_local_block(node, block_text)
             valid_found = False
             for email in sorted(emails):
-                ok, reason = classify_email(
+                ok, reason = classify_institution_email(
                     email,
-                    institution.host,
+                    institution,
                     allow_published_affiliate=is_verified_evidence_page(page_url, institution),
                 )
                 if ok:
@@ -3711,9 +4585,9 @@ def extract_pdf_contacts(
                     rejections.append(Rejection(name, "Administrative context", page.url, context[:180]))
                     continue
                 for email in emails:
-                    ok, email_reason = classify_email(
+                    ok, email_reason = classify_institution_email(
                         email,
-                        institution.host,
+                        institution,
                         allow_published_affiliate=is_verified_evidence_page(page.url, institution),
                     )
                     if ok:
@@ -3729,11 +4603,11 @@ def extract_verified_evidence_contacts(
     region: str,
 ) -> tuple[list[Contact], list[Rejection], bool]:
     evidence_url = normalize_url(institution.evidence_url)
-    if not evidence_url or not related_official_domain(evidence_url, institution.host):
+    if not evidence_url or not institution_related_domain(evidence_url, institution):
         return [], [], False
 
     html, final_url, _ = fetch_html(make_session(), evidence_url)
-    if not html or not final_url or not related_official_domain(final_url, institution.host):
+    if not html or not final_url or not institution_related_domain(final_url, institution):
         return [], [], False
 
     soup = BeautifulSoup(html, "html.parser")
@@ -3787,9 +4661,9 @@ def extract_verified_evidence_contacts(
             continue
 
         for email in emails:
-            ok, reason = classify_email(
+            ok, reason = classify_institution_email(
                 email,
-                institution.host,
+                institution,
                 allow_published_affiliate=True,
             )
             pair = (normalize_person_name(block_name), email)
@@ -3849,14 +4723,7 @@ def process_institution(
             f"Verified discovery evidence yielded {len(evidence_contacts)} faculty contact(s)."
         )
     if evidence_contacts and evidence_is_regional_program:
-        report.department_pages = 1
-        report.faculty_roster_entries = len(evidence_contacts)
-        report.pages_checked = 1
-        report.contacts_found = len(evidence_contacts)
-        report.status = "Verified contacts found"
         report.notes.append("Region-specific teaching page used as the authoritative contact source.")
-        update_activity(f"✨ Finishing {institution.name}...")
-        return evidence_contacts, report
 
     def best_published_fallback(
         department_pages: list[PageCandidate],
@@ -3899,39 +4766,36 @@ def process_institution(
     )
     report.department_pages = len(department_pages)
     report.notes.extend(department_log[:5])
-    if not department_pages:
-        update_activity(f"✨ Finishing {institution.name}...")
-        if evidence_contacts:
-            report.contacts_found = len(evidence_contacts)
-            report.status = "Verified contacts found"
-            return evidence_contacts, report
-        fallback_result = best_published_fallback([], seed_cache)
-        if fallback_result:
-            return fallback_result
-        report.status = "Relevant department not found"
-        return [], report
-
-    update_activity("📄 Reviewing discovered pages...")
-    roster_entries, faculty_pages, role_rejections, page_cache, crawl_log, blocked = discover_faculty_roster(
-        department_pages=department_pages,
-        institution=institution,
-        terms=terms,
-        delay_seconds=delay_seconds,
-        disallowed_paths=disallowed_paths,
-        seed_cache=seed_cache,
-    )
-    unfiltered_roster_count = len(roster_entries)
-    roster_entries = filter_roster_to_location(
-        roster_entries,
-        country_code,
-        region,
-        region_code,
-        region_kind,
-    )
-    if len(roster_entries) != unfiltered_roster_count:
-        report.notes.append(
-            f"Location-labeled roster filtered from {unfiltered_roster_count} to {len(roster_entries)} entries."
+    if department_pages:
+        update_activity("📄 Reviewing discovered pages...")
+        roster_entries, faculty_pages, role_rejections, page_cache, crawl_log, blocked = discover_faculty_roster(
+            department_pages=department_pages,
+            institution=institution,
+            terms=terms,
+            delay_seconds=delay_seconds,
+            disallowed_paths=disallowed_paths,
+            seed_cache=seed_cache,
         )
+        unfiltered_roster_count = len(roster_entries)
+        roster_entries = filter_roster_to_location(
+            roster_entries,
+            country_code,
+            region,
+            region_code,
+            region_kind,
+        )
+        if len(roster_entries) != unfiltered_roster_count:
+            report.notes.append(
+                f"Location-labeled roster filtered from {unfiltered_roster_count} to {len(roster_entries)} entries."
+            )
+    else:
+        roster_entries = []
+        faculty_pages = []
+        role_rejections = []
+        page_cache = dict(seed_cache)
+        crawl_log = []
+        blocked = []
+        report.notes.append("Initial department discovery returned no qualifying page; completeness audit required.")
     report.faculty_roster_entries = len(roster_entries)
     report.pages_checked = len(crawl_log)
     report.blocked_or_unreadable.extend(blocked)
@@ -3942,33 +4806,20 @@ def process_institution(
     pdf_contacts, pdf_rejections = extract_pdf_contacts(department_pages, institution, terms)
     report.rejections.extend(pdf_rejections)
 
-    if not roster_entries:
-        update_activity(f"✨ Finishing {institution.name}...")
-        verified_contacts = deduplicate_contacts(evidence_contacts + pdf_contacts)
-        if verified_contacts:
-            report.contacts_found = len(verified_contacts)
-            report.status = "Verified contacts found"
-            return verified_contacts, report
-        fallback_result = best_published_fallback(department_pages, page_cache)
-        if fallback_result:
-            return fallback_result
-        if any("JavaScript-only" in line for line in crawl_log):
-            report.status = "JavaScript-only directory"
-        elif blocked and not crawl_log:
-            report.status = "Website blocked automated access"
-        else:
-            report.status = "Faculty page not found"
-        return [], report
-
-    update_activity("🧭 Following relevant faculty links...")
-    profile_links = discover_profile_links(page_cache, institution.host, roster_entries)
-    profile_contacts, profile_rejections, profile_log, profile_blocked = crawl_profiles(
-        profile_links=profile_links,
-        institution=institution,
-        roster_entries=roster_entries,
-        delay_seconds=delay_seconds,
-        disallowed_paths=disallowed_paths,
-    )
+    profile_contacts: list[Contact] = []
+    profile_rejections: list[Rejection] = []
+    profile_log: list[str] = []
+    profile_blocked: list[str] = []
+    if roster_entries:
+        update_activity("🧭 Following relevant faculty links...")
+        profile_links = discover_profile_links(page_cache, institution, roster_entries)
+        profile_contacts, profile_rejections, profile_log, profile_blocked = crawl_profiles(
+            profile_links=profile_links,
+            institution=institution,
+            roster_entries=roster_entries,
+            delay_seconds=delay_seconds,
+            disallowed_paths=disallowed_paths,
+        )
     report.profiles_checked = len(profile_log)
     report.rejections.extend(profile_rejections)
     report.blocked_or_unreadable.extend(profile_blocked)
@@ -3979,9 +4830,105 @@ def process_institution(
     card_contacts, card_rejections = extract_card_level_contacts(roster_entries, institution, page_cache, covered_names)
     report.rejections.extend(card_rejections)
 
+    initial_personal_contacts = deduplicate_contacts(
+        evidence_contacts + profile_contacts + card_contacts + pdf_contacts
+    )
+
+    update_activity("🔍 Running independent completeness audit...")
+    if len(initial_personal_contacts) < 5:
+        report.notes.append(
+            f"Low-result audit triggered after {len(initial_personal_contacts)} initial verified contact(s)."
+        )
+    audit_pages, audit_seed_cache, audit_log = discover_second_pass_pages(
+        institution=institution,
+        specialty=specialty,
+        terms=terms,
+        existing_urls={page.url for page in department_pages} | set(page_cache),
+        disallowed_paths=disallowed_paths,
+        country_code=country_code,
+    )
+    report.notes.extend(audit_log)
+    report.department_pages += len(audit_pages)
+
+    audit_profile_contacts: list[Contact] = []
+    audit_card_contacts: list[Contact] = []
+    audit_pdf_contacts: list[Contact] = []
+    if audit_pages:
+        audit_roster, audit_faculty_pages, audit_role_rejections, audit_page_cache, audit_crawl_log, audit_blocked = discover_faculty_roster(
+            department_pages=audit_pages,
+            institution=institution,
+            terms=terms,
+            delay_seconds=delay_seconds,
+            disallowed_paths=disallowed_paths,
+            seed_cache=audit_seed_cache,
+        )
+        audit_roster = filter_roster_to_location(
+            audit_roster,
+            country_code,
+            region,
+            region_code,
+            region_kind,
+        )
+        existing_roster_names = {entry.normalized_name for entry in roster_entries}
+        new_audit_roster = [
+            entry for entry in audit_roster if entry.normalized_name not in existing_roster_names
+        ]
+        roster_entries.extend(new_audit_roster)
+        page_cache.update(audit_page_cache)
+        report.faculty_roster_entries = len(roster_entries)
+        report.pages_checked += len(audit_crawl_log)
+        report.blocked_or_unreadable.extend(audit_blocked)
+        report.rejections.extend(audit_role_rejections)
+        report.notes.extend(audit_crawl_log)
+
+        audit_pdf_contacts, audit_pdf_rejections = extract_pdf_contacts(
+            audit_pages,
+            institution,
+            terms,
+        )
+        report.rejections.extend(audit_pdf_rejections)
+
+        audit_profile_links = discover_profile_links(
+            audit_page_cache,
+            institution,
+            audit_roster,
+        )
+        audit_profile_contacts, audit_profile_rejections, audit_profile_log, audit_profile_blocked = crawl_profiles(
+            profile_links=audit_profile_links,
+            institution=institution,
+            roster_entries=audit_roster,
+            delay_seconds=delay_seconds,
+            disallowed_paths=disallowed_paths,
+        )
+        report.profiles_checked += len(audit_profile_log)
+        report.rejections.extend(audit_profile_rejections)
+        report.blocked_or_unreadable.extend(audit_profile_blocked)
+        report.notes.extend(audit_profile_log)
+
+        audit_covered_names = {
+            normalize_person_name(contact.name)
+            for contact in initial_personal_contacts + audit_profile_contacts
+        }
+        audit_card_contacts, audit_card_rejections = extract_card_level_contacts(
+            audit_roster,
+            institution,
+            audit_page_cache,
+            audit_covered_names,
+        )
+        report.rejections.extend(audit_card_rejections)
+        report.notes.append(
+            f"Second-pass audit found {len(new_audit_roster)} new roster candidate(s) "
+            f"across {len(audit_pages)} accepted page(s)."
+        )
+    else:
+        report.notes.append("Second-pass audit found no new qualifying official pages.")
+
     update_activity(f"✨ Finishing {institution.name}...")
     personal_contacts = deduplicate_contacts(
-        evidence_contacts + profile_contacts + card_contacts + pdf_contacts
+        initial_personal_contacts
+        + audit_profile_contacts
+        + audit_card_contacts
+        + audit_pdf_contacts
     )
     if personal_contacts:
         report.contacts_found = len(personal_contacts)
@@ -4015,27 +4962,37 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-watermark_path = Path(__file__).parent / "assets" / "medical-technology-background.png"
-watermark_data = ""
-if watermark_path.exists():
+app_directory = Path(__file__).parent
+watermark_paths = (
+    app_directory / "assets" / "medical-technology-background.png",
+    app_directory / "medical-technology-background.png",
+)
+watermark_path = next((path for path in watermark_paths if path.exists()), None)
+if watermark_path:
     watermark_data = base64.b64encode(watermark_path.read_bytes()).decode("ascii")
+    watermark_mime = "image/png"
+else:
+    watermark_data = EMBEDDED_BACKGROUND_WEBP
+    watermark_mime = "image/webp"
+watermark_url = f'data:{watermark_mime};base64,{watermark_data}'
 
 st.markdown(
     f"""
     <style>
-    .stApp {{ background: #071a42; }}
+    .stApp {{ background: #11161c; }}
+    header[data-testid="stHeader"] {{ background: rgba(17, 22, 28, 0.96); }}
     .stApp::before {{
         content: "";
         position: fixed;
         inset: 0;
         z-index: 0;
         pointer-events: none;
-        background-image:
-            linear-gradient(rgba(3, 12, 35, 0.42), rgba(3, 12, 35, 0.60)),
-            url("data:image/png;base64,{watermark_data}");
-        background-position: center;
-        background-size: cover;
+        background-image: url("{watermark_url}");
+        background-position: right 1rem top 5rem;
+        background-size: min(720px, 54vw) auto;
         background-repeat: no-repeat;
+        filter: grayscale(0.72) saturate(0.45) brightness(0.72);
+        opacity: 0.2;
         animation: medical-background-drift 24s ease-in-out infinite alternate;
     }}
     .stApp > * {{ position: relative; z-index: 1; }}
@@ -4047,6 +5004,10 @@ st.markdown(
         .stApp::before {{ animation: none; }}
     }}
     .block-container {{ max-width: 1180px; padding-top: 1.5rem; }}
+    div[data-testid="stVerticalBlockBorderWrapper"] {{
+        background: rgba(17, 22, 28, 0.93);
+        backdrop-filter: blur(7px);
+    }}
     button[data-testid="stBaseButton-primary"] {{
         background: #0877b9;
         border-color: #0877b9;
@@ -4069,7 +5030,21 @@ st.markdown(
     .small-note {{ color: #9ba7ba; font-size: 0.92rem; line-height: 1.45; }}
     @media (max-width: 640px) {{
         .block-container {{ padding-top: 3.75rem; }}
-        .stApp::before {{ background-position: 46% center; }}
+        h1 {{
+            font-size: 2.1rem !important;
+            line-height: 1.14 !important;
+            overflow-wrap: anywhere;
+        }}
+        .small-note {{
+            font-size: 0.88rem;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }}
+        .stApp::before {{
+            background-position: right -10rem top 6rem;
+            background-size: auto 66vh;
+            opacity: 0.12;
+        }}
     }}
     </style>
     """,
@@ -4338,6 +5313,11 @@ with st.expander("Diagnostics"):
         st.markdown("**Institution status**")
         st.dataframe(pd.DataFrame([report.as_row() for report in reports]), use_container_width=True, hide_index=True)
 
+        st.markdown("**Research audit log**")
+        for report in reports:
+            with st.expander(report.institution):
+                st.code("\n".join(report.notes) or "No audit entries recorded.")
+
         rejection_rows = [
             {
                 "Institution": report.institution,
@@ -4361,6 +5341,25 @@ with st.expander("Diagnostics"):
         if blocked_rows:
             st.markdown("**Blocked or unreadable pages**")
             st.dataframe(pd.DataFrame(blocked_rows), use_container_width=True, hide_index=True)
+
+    if contacts:
+        st.markdown("**Verified contact evidence**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Name": contact.name,
+                    "Email": contact.email,
+                    "Institution": contact.institution,
+                    "Profile URL": contact.profile_url,
+                    "Email Source URL": contact.email_source_url,
+                    "Evidence": contact.relevance_evidence,
+                    "Confidence": contact.confidence,
+                }
+                for contact in contacts
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     if st.session_state.institution_log:
         st.markdown("**Institution discovery log**")

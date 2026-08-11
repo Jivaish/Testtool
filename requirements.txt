@@ -7,3 +7,4 @@ ddgs>=9.0,<10
 pypdf>=5.0,<7
 pycountry>=24.6,<27
 geonamescache>=3.0,<4
+playwright>=1.52,<2

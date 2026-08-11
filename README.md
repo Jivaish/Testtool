@@ -22,9 +22,13 @@ final authority for an institution or contact.
 Institution results are canonicalized by verified organization identity, so multiple
 subdomains and alternate result titles do not create repeated institutions. Generic
 facility labels and residency-program titles are not treated as universities or medical
-schools. When a strong official academic candidate lacks specialty evidence in the first
-result set, the app performs a targeted follow-up restricted to that institution's own
-domain.
+schools. Parent-owned centers, libraries, health systems, and academic hospital domains
+are retained as additional official evidence sources without becoming duplicate choices.
+An institution is accepted only when official content proves a relevant academic unit,
+academic program, or required medical-training relationship; a clinical service or course
+mention alone is insufficient. When a strong official academic candidate lacks specialty
+evidence in the first result set, the app performs targeted faculty, curriculum, and
+training follow-ups restricted to that institution's own domain.
 
 Country selection uses the full ISO country list. The location dropdown combines official country subdivisions with searchable city data, and includes an all-regions option.
 
@@ -50,6 +54,14 @@ Accuracy is prioritized over quantity. A contact is returned only when:
 - the name and email are locally associated on a profile, card, directory row, official PDF, or similar source.
 
 The app never guesses, generates, constructs, infers, or predicts emails from names.
+
+For every selected institution, the crawler expands the specialty into related academic
+units, classifies official pages, builds a candidate-person pool, visits available
+profiles, verifies displayed email evidence, deduplicates contacts, and runs an
+independent second-pass audit. A low initial yield triggers the same broader audit rather
+than an early zero-result conclusion. Diagnostics retain discovered URLs, page
+classification, acceptance/rejection reasons, profile and email-source URLs, relevance
+evidence, and confidence.
 
 ## No-Public-Email Fallback
 
@@ -90,6 +102,7 @@ source .venv/bin/activate
 2. Upload only these files to the repository root:
    - `app.py`
    - `requirements.txt`
+   - `packages.txt`
    - `README.md`
    - `.gitignore`
    - `assets/medical-technology-background.png`
@@ -119,10 +132,11 @@ The institution search uses a live activity feed tied to actual crawler stages. 
 institutions remain visible, the current and next institutions are identified, and the
 percentage bar is kept as a secondary indicator.
 
-The interface uses the supplied medical-technology artwork as a responsive full-page
-background with subtle movement. Motion is disabled automatically for users who prefer
-reduced motion. Request throttling remains enabled internally without occupying a
-permanent settings sidebar.
+The interface uses the supplied medical-technology artwork as a softly desaturated,
+responsive watermark on a neutral charcoal background. The image is also embedded as a
+fallback so it remains available if an asset is omitted during deployment. Motion is
+disabled automatically for users who prefer reduced motion. Request throttling remains
+enabled internally without occupying a permanent settings sidebar.
 
 The crawler does not cap the number of institutions, department pages, faculty pages,
 profiles, pagination links, sitemap entries, or PDF pages it processes. Broad searches
@@ -132,8 +146,13 @@ placing artificial crawl limits in the interface.
 ## Known Limitations
 
 - Some websites block automated requests.
-- JavaScript-only directories may not expose faculty data in normal HTML.
+- JavaScript-only directories use a Playwright/Chromium fallback when dynamic-page
+  signals are detected; sites that block browsers can still require manual review.
 - Some institutions do not publish public personal faculty emails.
 - Sites with unusual HTML may require manual review.
 - Search results depend on the availability and quality of public web search.
 - Official PDFs are supported with lightweight text extraction, but complex scanned PDFs may not yield usable text.
+- Very large multi-domain academic medical centers can take longer than 20 minutes when
+  the unrestricted second-pass audit is enabled. The live activity feed remains active,
+  but production deployments may eventually benefit from a persistent background-job
+  queue so these crawls can resume independently of one Streamlit session.
