@@ -3499,7 +3499,8 @@ def roster_name_match(candidate: str, roster_names: set[str]) -> bool:
 CANDIDATE_NODE_SELECTOR = (
     "article, li, tr, [class*='faculty' i], [class*='person' i], "
     "[class*='profile' i], [class*='staff' i], [class*='card' i], "
-    "[class*='result' i], [class*='member' i], [class*='directory' i]"
+    "[class*='result' i], [class*='member' i], [class*='directory' i], "
+    "[class*='longeditbox' i]"
 )
 
 TITLE_SELECTORS = (
@@ -5189,7 +5190,7 @@ def extract_card_level_contacts(
             block_text = clean_text(node.get_text(" ", strip=True))
             if is_admin_context(block_text):
                 continue
-            if len(collect_names_in_node(node)) != 1 and node.name not in {"article", "tr"}:
+            if len(collect_names_in_node(node)) != 1:
                 continue
             emails = emails_in_local_block(node, block_text)
             valid_found = False
@@ -5376,6 +5377,328 @@ def parse_manual_source_urls(value: str) -> list[str]:
     return urls
 
 
+def manual_directory_query_terms(
+    specialty: str,
+    custom_keywords: str,
+    terms: list[str],
+) -> list[str]:
+    """Build human-sized queries for public department directory forms."""
+    source_values = [specialty, *(custom_keywords or "").split(","), *terms]
+    stopwords = {
+        "and", "the", "for", "department", "division", "program", "programme",
+        "school", "college", "faculty", "medicine", "medical", "health",
+        "custom",
+    }
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        cleaned = clean_text(value).strip(" ,;:-")
+        key = fold_text(cleaned)
+        if cleaned and key and key not in seen:
+            seen.add(key)
+            queries.append(cleaned)
+
+    for value in source_values:
+        cleaned = clean_text(value)
+        for token in re.findall(r"[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019-]*", cleaned):
+            token = re.sub(r"(?:'s|\u2019s)$", "", token, flags=re.I)
+            if len(token) >= 4 and fold_text(token) not in stopwords:
+                add(token)
+        add(cleaned)
+    return queries
+
+
+def manual_directory_link_score(label: str, target_url: str, desired_terms: list[str]) -> int:
+    label_folded = fold_text(label)
+    if not label_folded:
+        return 0
+    desired = [fold_text(term) for term in desired_terms if fold_text(term)]
+    score = 0
+    for term in desired:
+        if label_folded == term:
+            score = max(score, 240)
+        elif term in label_folded or label_folded in term:
+            score = max(score, 150)
+
+    label_tokens = {
+        token for token in re.findall(r"[a-z0-9]+", label_folded)
+        if len(token) >= 4
+    }
+    desired_tokens = {
+        token for term in desired for token in re.findall(r"[a-z0-9]+", term)
+        if len(token) >= 4
+    }
+    overlap = label_tokens & desired_tokens
+    minimum_overlap = 1 if len(desired_tokens) <= 1 else 2
+    if len(overlap) >= minimum_overlap:
+        score = max(score, 40 * len(overlap))
+    if score and any(marker in fold_text(target_url) for marker in ("dept", "department", "division", "program")):
+        score += 10
+    return score
+
+
+def prepare_manual_directory_form(
+    form: Tag,
+    page_url: str,
+    query: str,
+    institution: Institution,
+) -> tuple[str, str, dict[str, str]] | None:
+    method = clean_text(form.get("method") or "get").lower()
+    if method not in {"get", "post"}:
+        return None
+    action = normalize_url(urljoin(page_url, clean_text(form.get("action")) or page_url))
+    if not action or not institution_related_domain(action, institution):
+        return None
+
+    text_inputs = [
+        control
+        for control in form.find_all("input")
+        if control.get("name")
+        and clean_text(control.get("type") or "text").casefold() in {"text", "search"}
+    ]
+    if not text_inputs:
+        return None
+    text_inputs.sort(
+        key=lambda control: (
+            not any(
+                marker in fold_text(f"{control.get('name', '')} {control.get('id', '')}")
+                for marker in ("search", "query", "keyword", "term", "string")
+            ),
+            clean_text(control.get("name")),
+        )
+    )
+    query_field = clean_text(text_inputs[0].get("name"))
+    fields: dict[str, str] = {}
+    for control in form.find_all("input"):
+        name = clean_text(control.get("name"))
+        input_type = clean_text(control.get("type") or "text").casefold()
+        if not name or name == query_field:
+            continue
+        if input_type == "hidden":
+            fields[name] = clean_text(control.get("value"))
+        elif input_type in {"radio", "checkbox"} and control.has_attr("checked"):
+            fields[name] = clean_text(control.get("value"))
+
+    for select in form.find_all("select", attrs={"name": True}):
+        options = select.find_all("option")
+        if not options:
+            continue
+        def option_score(option: Tag) -> int:
+            label = fold_text(option.get_text(" ", strip=True))
+            score = 0
+            if label == "department search" or label.startswith("department search"):
+                score = 120
+            elif label.startswith("department"):
+                score = 105
+            elif "academic unit" in label:
+                score = 90
+            elif "division" in label or "program" in label:
+                score = 80
+            elif "department" in label:
+                score = 60
+            if "dean" in label or "chair" in label:
+                score -= 45
+            return score
+
+        chosen = max(options, key=option_score) if any(option_score(option) > 0 for option in options) else None
+        chosen = chosen or next((option for option in options if option.has_attr("selected")), options[0])
+        fields[clean_text(select.get("name"))] = clean_text(
+            chosen.get("value") if chosen.get("value") is not None else chosen.get_text(" ", strip=True)
+        )
+
+    submit_controls = [
+        control
+        for control in form.find_all(["input", "button"])
+        if clean_text(control.get("type") or "submit").casefold() in {"submit", "button"}
+    ]
+    submit_controls.sort(
+        key=lambda control: "search" not in fold_text(
+            f"{control.get('value', '')} {control.get_text(' ', strip=True)} {control.get('id', '')}"
+        )
+    )
+    if submit_controls:
+        submit = submit_controls[0]
+        submit_name = clean_text(submit.get("name"))
+        submit_value = clean_text(submit.get("value") or submit.get_text(" ", strip=True))
+        if submit_name:
+            fields[submit_name] = submit_value
+        if "ICAction" in fields:
+            fields["ICAction"] = clean_text(submit.get("id") or submit_name)
+
+    fields[query_field] = query
+    return method, action, fields
+
+
+def recover_public_directory_pages(
+    source_url: str,
+    institution: Institution,
+    specialty: str,
+    custom_keywords: str,
+    terms: list[str],
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Submit public directory forms and follow matching department results."""
+    pages: dict[str, str] = {}
+    notes: list[str] = []
+    desired_terms = [specialty, *(custom_keywords or "").split(","), *terms]
+
+    for query in manual_directory_query_terms(specialty, custom_keywords, terms):
+        query_session = make_session()
+        seed_html, seed_url, seed_error = fetch_html(query_session, source_url)
+        if not seed_html or not seed_url:
+            notes.append(f"Directory form unavailable: {seed_error or source_url}")
+            continue
+        seed_soup = BeautifulSoup(seed_html, "html.parser")
+        page_identity = fold_text(
+            f"{seed_url} {seed_soup.title.get_text(' ', strip=True) if seed_soup.title else ''} "
+            f"{seed_soup.get_text(' ', strip=True)[:1200]}"
+        )
+        if not any(marker in page_identity for marker in ("directory", "search", "people")):
+            return [], notes
+
+        submitted = False
+        for form in seed_soup.find_all("form"):
+            prepared = prepare_manual_directory_form(form, seed_url, query, institution)
+            if not prepared:
+                continue
+            submitted = True
+            method, action, fields = prepared
+            try:
+                if method == "post":
+                    response = query_session.post(
+                        action,
+                        data=fields,
+                        headers=HEADERS,
+                        timeout=DEFAULT_TIMEOUT,
+                        allow_redirects=True,
+                    )
+                else:
+                    response = query_session.get(
+                        action,
+                        params=fields,
+                        headers=HEADERS,
+                        timeout=DEFAULT_TIMEOUT,
+                        allow_redirects=True,
+                    )
+                if response.status_code in {401, 403, 429}:
+                    notes.append(f"Directory search blocked or rate limited ({response.status_code}): {action}")
+                    continue
+                response.raise_for_status()
+                if len(response.content) > MAX_RESPONSE_BYTES:
+                    notes.append(f"Directory response too large: {action}")
+                    continue
+            except requests.RequestException as exc:
+                notes.append(f"Directory search failed: {action} ({exc.__class__.__name__})")
+                continue
+
+            response_url = normalize_url(response.url)
+            if not response_url or not institution_related_domain(response_url, institution):
+                continue
+            response_soup = BeautifulSoup(response.text, "html.parser")
+            response_text = clean_text(response_soup.get_text(" ", strip=True))
+            response_emails = decode_visible_emails(str(response_soup))
+            if response_emails and matched_allowed_title(response_text):
+                pages[response_url] = response.text
+                notes.append(f"Public directory search returned contacts for: {query}")
+                continue
+
+            result_links: list[tuple[int, str]] = []
+            for anchor in response_soup.find_all("a", href=True):
+                target = normalize_url(urljoin(response_url, anchor.get("href", "")))
+                label = clean_text(anchor.get_text(" ", strip=True))
+                if not target or not institution_related_domain(target, institution):
+                    continue
+                score = manual_directory_link_score(label, target, desired_terms)
+                if score:
+                    result_links.append((score, target))
+            for _, target in sorted(set(result_links), key=lambda item: (-item[0], item[1])):
+                detail_html, detail_url, detail_error = fetch_html(query_session, target)
+                if not detail_html or not detail_url:
+                    if detail_error:
+                        notes.append(f"Directory result unavailable: {target} ({detail_error})")
+                    continue
+                detail_soup = BeautifulSoup(detail_html, "html.parser")
+                detail_text = clean_text(detail_soup.get_text(" ", strip=True))
+                if decode_visible_emails(str(detail_soup)) and matched_allowed_title(detail_text):
+                    pages[detail_url] = detail_html
+                    notes.append(f"Followed matching public directory result: {target}")
+        if not submitted:
+            return [], notes
+        if pages:
+            break
+    return [(html, url) for url, html in pages.items()], notes
+
+
+def extract_contacts_from_directory_text(
+    value: str,
+    institution: Institution,
+    source_url: str,
+    method: str,
+    include_excluded_roles: bool = True,
+) -> tuple[list[Contact], list[Rejection]]:
+    """Pair each visible institutional email with the nearest preceding person name."""
+    text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    matches = list(EMAIL_RE.finditer(text))
+    contacts: list[Contact] = []
+    rejections: list[Rejection] = []
+    previous_end = 0
+
+    for match in matches:
+        email = trim_run_on_email(match.group(0).lower())
+        segment = text[previous_end:match.start()][-1800:]
+        previous_end = match.end()
+        if not include_excluded_roles:
+            role_reason = excluded_role_reason(segment)
+            if role_reason:
+                rejections.append(Rejection(email, role_reason, source_url, email))
+                continue
+
+        raw_candidates: list[tuple[str, int]] = []
+        lines = [clean_text(line) for line in segment.splitlines() if clean_text(line)]
+        for distance, line in enumerate(reversed(lines[-18:])):
+            if "@" in line or any(char.isdigit() for char in line) or ":" in line:
+                continue
+            candidate = clean_name(line)
+            if valid_name(candidate):
+                raw_candidates.append((line, max(0, 30 - distance)))
+
+        for name_match in re.finditer(
+            r"([A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'.-]{1,45},\s*"
+            r"[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'. -]{1,70}?)"
+            r"(?=\s+(?:Faculty|Professor|Associate|Assistant|Lecturer|Instructor|Phone|Email)\b)",
+            segment,
+        ):
+            raw_candidates.append((name_match.group(1), 45))
+
+        local_compact = compact_local(email.split("@", 1)[0])
+        candidates: dict[str, tuple[str, int]] = {}
+        for raw_name, proximity in raw_candidates:
+            name = clean_name(raw_name)
+            if not valid_name(name):
+                continue
+            score = proximity + (45 if "," in raw_name else 0)
+            for token in normalize_person_name(name).split():
+                compact = compact_local(token)
+                if len(compact) >= 2 and compact in local_compact:
+                    score += 28
+                elif compact and local_compact.startswith(compact[:1]):
+                    score += 2
+            existing = candidates.get(normalize_person_name(name))
+            if not existing or score > existing[1]:
+                candidates[normalize_person_name(name)] = (name, score)
+
+        if not candidates:
+            rejections.append(Rejection(email, "No person name near visible email", source_url, email))
+            continue
+        name, _ = max(candidates.values(), key=lambda item: item[1])
+        accepted, email_reason = classify_institution_email(email, institution)
+        if not accepted:
+            rejections.append(Rejection(name, email_reason or "Invalid institutional email", source_url, email))
+            continue
+        contacts.append(Contact(name, email, institution.name, source_url, method, 2))
+    return deduplicate_contacts(contacts), rejections
+
+
 def authorize_manual_source_domain(
     institution: Institution,
     source_url: str,
@@ -5433,6 +5756,7 @@ def process_manual_faculty_pages(
     region_code: str = "",
     region_kind: str = "Region",
     progress_callback: Callable[[str], None] | None = None,
+    visible_page_text: str = "",
 ) -> tuple[list[Contact], InstitutionReport]:
     del country
 
@@ -5455,7 +5779,54 @@ def process_manual_faculty_pages(
 
     accepted_pages: list[PageCandidate] = []
     seed_cache: dict[str, str] = {}
-    for source_url in list(dict.fromkeys(normalize_url(url) for url in source_urls if normalize_url(url))):
+    supplied_urls = list(dict.fromkeys(normalize_url(url) for url in source_urls if normalize_url(url)))
+    pasted_contacts, pasted_rejections = extract_contacts_from_directory_text(
+        visible_page_text,
+        institution,
+        supplied_urls[0] if supplied_urls else institution.official_url,
+        "Pasted visible directory text",
+    )
+    report.rejections.extend(pasted_rejections)
+    if pasted_contacts:
+        report.notes.append(f"Pasted visible directory text yielded {len(pasted_contacts)} contact(s).")
+
+    def accept_html_page(page_html: str, page_url: str, source: str) -> bool:
+        soup = BeautifulSoup(page_html, "html.parser")
+        title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+        page_text = clean_text(soup.get_text(" ", strip=True))
+        matched_terms = text_matches_terms(f"{page_url} {title} {page_text[:12000]}", terms)
+        faculty_identity = any(
+            marker in fold_text(f"{page_url} {title} {page_text[:5000]}")
+            for marker in (
+                "faculty", "academic staff", "our team", "people", "provider",
+                "physician", "professor", "department", "division", "researcher",
+            )
+        )
+        if not faculty_identity:
+            return False
+        classification = classify_official_page(page_url, title, page_text, page_html)
+        if classification == "IRRELEVANT":
+            classification = "FACULTY_DIRECTORY"
+        seed_cache[page_url] = page_html
+        accepted_pages.append(
+            PageCandidate(
+                page_url,
+                title,
+                matched_terms,
+                source,
+                relevance_score(page_url, title, page_text, terms),
+                classification,
+            )
+        )
+        if not matched_terms:
+            report.notes.append(
+                f"Accepted user-supplied faculty source without enforcing specialty keywords: {page_url}"
+            )
+        else:
+            report.notes.append(f"Accepted supplied faculty source: {page_url}")
+        return True
+
+    for source_url in supplied_urls:
         update_activity("Opening supplied faculty page...")
         if not authorize_manual_source_domain(institution, source_url, region, terms):
             report.blocked_or_unreadable.append(
@@ -5473,8 +5844,20 @@ def process_manual_faculty_pages(
                 continue
             final_url = source_url
             title = urlparse(source_url).path.rsplit("/", 1)[-1]
-            html = ""
             classification = "FACULTY_DIRECTORY" if "faculty" in fold_text(page_text[:5000]) else "SEARCH_RESULT"
+            matched_terms = text_matches_terms(f"{final_url} {title} {page_text[:12000]}", terms)
+            accepted_pages.append(
+                PageCandidate(
+                    final_url,
+                    title,
+                    matched_terms,
+                    "manual_faculty_page",
+                    relevance_score(final_url, title, page_text, terms),
+                    classification,
+                )
+            )
+            report.notes.append(f"Accepted supplied PDF source: {final_url}")
+            continue
         else:
             html, final_url, error = fetch_html(session, source_url)
             if not html or not final_url:
@@ -5485,47 +5868,57 @@ def process_manual_faculty_pages(
                     f"{source_url}: redirected outside verified institutional domains"
                 )
                 continue
-            soup = BeautifulSoup(html, "html.parser")
-            title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
-            page_text = clean_text(soup.get_text(" ", strip=True))
-            classification = classify_official_page(final_url, title, page_text, html)
-            seed_cache[final_url] = html
 
-        matched_terms = text_matches_terms(f"{final_url} {title} {page_text[:12000]}", terms)
-        faculty_identity = any(
-            marker in fold_text(f"{final_url} {title} {page_text[:5000]}")
-            for marker in (
-                "faculty", "academic staff", "our team", "people", "provider",
-                "physician", "professor", "department", "division", "researcher",
-            )
-        )
-        if not matched_terms or not faculty_identity:
+            direct_soup = BeautifulSoup(html, "html.parser")
+            direct_text = clean_text(direct_soup.get_text(" ", strip=True))
+            direct_emails = decode_visible_emails(str(direct_soup))
+            accepted = False
+            if direct_emails or matched_allowed_title(direct_text):
+                accepted = accept_html_page(html, final_url, "manual_faculty_page")
+
+            if not accepted:
+                update_activity("Submitting the public directory search form...")
+                recovered_pages, recovery_notes = recover_public_directory_pages(
+                    source_url,
+                    institution,
+                    specialty,
+                    custom_keywords,
+                    terms,
+                )
+                report.notes.extend(recovery_notes)
+                for recovered_html, recovered_url in recovered_pages:
+                    if authorize_manual_source_domain(institution, recovered_url, region, terms):
+                        accepted = accept_html_page(
+                            recovered_html,
+                            recovered_url,
+                            "manual_directory_search",
+                        ) or accepted
+
+            if accepted:
+                continue
+            if "directory" in fold_text(
+                f"{final_url} {direct_soup.title.get_text(' ', strip=True) if direct_soup.title else ''}"
+            ):
+                report.blocked_or_unreadable.append(
+                    f"{source_url}: the copied URL opened a session-based directory search form, "
+                    "not the visible result page; paste the visible result text as the fallback"
+                )
             report.rejections.append(
                 Rejection(
                     institution.name,
-                    "Supplied page is not a faculty source for the requested specialty",
+                    "Supplied page did not expose a readable faculty result",
                     final_url,
-                    title,
+                    clean_text(direct_soup.title.get_text(" ", strip=True) if direct_soup.title else ""),
                 )
             )
-            continue
-        if classification == "IRRELEVANT":
-            classification = "FACULTY_DIRECTORY"
-        accepted_pages.append(
-            PageCandidate(
-                final_url,
-                title,
-                matched_terms,
-                "manual_faculty_page",
-                relevance_score(final_url, title, page_text, terms),
-                classification,
-            )
-        )
-        report.notes.append(f"Accepted supplied faculty source: {final_url}")
 
     accepted_pages = list({page.url: page for page in accepted_pages}.values())
     report.department_pages = len(accepted_pages)
     if not accepted_pages:
+        if pasted_contacts:
+            report.contacts_found = len(pasted_contacts)
+            report.status = "Verified contacts found"
+            return pasted_contacts, report
         report.status = "No valid supplied faculty page"
         return [], report
 
@@ -5588,7 +5981,25 @@ def process_manual_faculty_pages(
     report.rejections.extend(card_rejections)
     report.rejections.extend(pdf_rejections)
 
-    contacts = deduplicate_contacts(profile_contacts + card_contacts + pdf_contacts)
+    visible_directory_contacts: list[Contact] = []
+    for page_url, page_html in page_cache.items():
+        page_soup = BeautifulSoup(page_html, "html.parser")
+        found_contacts, found_rejections = extract_contacts_from_directory_text(
+            page_soup.get_text("\n", strip=True),
+            institution,
+            page_url,
+            "Visible faculty directory",
+        )
+        visible_directory_contacts.extend(found_contacts)
+        report.rejections.extend(found_rejections)
+
+    contacts = deduplicate_contacts(
+        pasted_contacts
+        + profile_contacts
+        + card_contacts
+        + pdf_contacts
+        + visible_directory_contacts
+    )
     update_activity(f"Finishing {institution.name}...")
     if contacts:
         report.contacts_found = len(contacts)
@@ -5692,6 +6103,49 @@ def process_institution(
         disallowed_paths=disallowed_paths,
         country_code=country_code,
     )
+    directory_seed_urls: list[str] = []
+    for candidate_url, candidate_html in seed_cache.items():
+        candidate_soup = BeautifulSoup(candidate_html, "html.parser")
+        candidate_identity = fold_text(
+            f"{candidate_url} "
+            f"{candidate_soup.title.get_text(' ', strip=True) if candidate_soup.title else ''}"
+        )
+        if "directory" in candidate_identity and candidate_soup.find("form"):
+            directory_seed_urls.append(candidate_url)
+
+    for directory_seed_url in directory_seed_urls:
+        recovered_pages, recovery_notes = recover_public_directory_pages(
+            directory_seed_url,
+            institution,
+            specialty,
+            custom_keywords,
+            terms,
+        )
+        report.notes.extend(recovery_notes)
+        for recovered_html, recovered_url in recovered_pages:
+            recovered_soup = BeautifulSoup(recovered_html, "html.parser")
+            recovered_title = clean_text(
+                recovered_soup.title.get_text(" ", strip=True) if recovered_soup.title else ""
+            )
+            recovered_text = clean_text(recovered_soup.get_text(" ", strip=True))
+            recovered_terms = text_matches_terms(
+                f"{recovered_url} {recovered_title} {recovered_text[:12000]}",
+                terms,
+            )
+            if not recovered_terms or not matched_allowed_title(recovered_text):
+                continue
+            seed_cache[recovered_url] = recovered_html
+            department_pages.append(
+                PageCandidate(
+                    recovered_url,
+                    recovered_title,
+                    recovered_terms,
+                    "public_directory_search",
+                    relevance_score(recovered_url, recovered_title, recovered_text, terms),
+                    "FACULTY_DIRECTORY",
+                )
+            )
+    department_pages = list({page.url: page for page in department_pages}.values())
     report.department_pages = len(department_pages)
     report.notes.extend(department_log[:5])
     if department_pages:
@@ -5758,8 +6212,47 @@ def process_institution(
     card_contacts, card_rejections = extract_card_level_contacts(roster_entries, institution, page_cache, covered_names)
     report.rejections.extend(card_rejections)
 
+    def visible_directory_contacts_from_cache(
+        cache: dict[str, str],
+    ) -> tuple[list[Contact], list[Rejection]]:
+        found: list[Contact] = []
+        rejected: list[Rejection] = []
+        for page_url, page_html in cache.items():
+            if not institution_related_domain(page_url, institution):
+                continue
+            page_soup = BeautifulSoup(page_html, "html.parser")
+            page_text = clean_text(page_soup.get_text(" ", strip=True))
+            page_title = clean_text(
+                page_soup.title.get_text(" ", strip=True) if page_soup.title else ""
+            )
+            if not text_matches_terms(f"{page_url} {page_title} {page_text[:12000]}", terms):
+                continue
+            if not matched_allowed_title(page_text):
+                continue
+            contacts, rejections = extract_contacts_from_directory_text(
+                page_soup.get_text("\n", strip=True),
+                institution,
+                page_url,
+                "Visible official faculty directory",
+                include_excluded_roles=False,
+            )
+            found.extend(contacts)
+            rejected.extend(rejections)
+        return deduplicate_contacts(found), rejected
+
+    initial_visible_contacts, initial_visible_rejections = visible_directory_contacts_from_cache(page_cache)
+    report.rejections.extend(initial_visible_rejections)
+    if initial_visible_contacts:
+        report.notes.append(
+            f"Visible official directory rows yielded {len(initial_visible_contacts)} contact(s)."
+        )
+
     initial_personal_contacts = deduplicate_contacts(
-        evidence_contacts + profile_contacts + card_contacts + pdf_contacts
+        evidence_contacts
+        + profile_contacts
+        + card_contacts
+        + pdf_contacts
+        + initial_visible_contacts
     )
 
     update_activity("🔍 Running independent completeness audit...")
@@ -5852,11 +6345,15 @@ def process_institution(
     else:
         report.notes.append("Second-pass audit found no new qualifying official pages.")
 
+    all_visible_contacts, all_visible_rejections = visible_directory_contacts_from_cache(page_cache)
+    report.rejections.extend(all_visible_rejections)
+
     contacts_before_directory = deduplicate_contacts(
         initial_personal_contacts
         + audit_profile_contacts
         + audit_card_contacts
         + audit_pdf_contacts
+        + all_visible_contacts
     )
     covered_before_directory = {
         normalize_person_name(contact.name)
@@ -5943,6 +6440,7 @@ def process_institution(
         + audit_profile_contacts
         + audit_card_contacts
         + audit_pdf_contacts
+        + all_visible_contacts
         + directory_contacts
         + person_search_contacts
     )
@@ -6135,7 +6633,7 @@ if st.session_state.discovery_scope and st.session_state.discovery_scope != curr
     st.session_state.reports = []
     st.session_state.discovery_scope = None
     for state_key in list(st.session_state):
-        if state_key.startswith("manual_faculty_urls_"):
+        if state_key.startswith(("manual_faculty_urls_", "manual_visible_text_")):
             del st.session_state[state_key]
 
 if discover_clicked:
@@ -6166,7 +6664,7 @@ if discover_clicked:
     st.session_state.reports = []
     st.session_state.discovery_scope = current_scope
     for state_key in list(st.session_state):
-        if state_key.startswith("manual_faculty_urls_"):
+        if state_key.startswith(("manual_faculty_urls_", "manual_visible_text_")):
             del st.session_state[state_key]
 
 institutions: list[Institution] = deduplicate_institutions(st.session_state.institutions)
@@ -6236,9 +6734,11 @@ if institutions:
 
     selected = [item for item in institutions if item.name in selected_names]
     manual_sources: dict[str, list[str]] = {}
+    manual_visible_texts: dict[str, str] = {}
     if manual_mode:
         for institution in selected:
             widget_key = f"manual_faculty_urls_{slugify(institution.name)}"
+            text_widget_key = f"manual_visible_text_{slugify(institution.name)}"
             with st.expander(institution.name, expanded=len(selected) <= 3):
                 st.link_button(
                     "Open official website",
@@ -6252,6 +6752,13 @@ if institutions:
                     placeholder="https://university.edu/department/faculty",
                 )
                 manual_sources[institution.name] = parse_manual_source_urls(raw_sources)
+                manual_visible_texts[institution.name] = st.text_area(
+                    "Visible directory results (optional)",
+                    key=text_widget_key,
+                    height=130,
+                    placeholder="Paste the copied result-page text here when the URL is session-based.",
+                    help="Use this only when the directory URL reopens a blank search form. Copy the visible result page and paste it here.",
+                )
 
     action_label = "Extract Contacts from Faculty Pages" if manual_mode else "Search Selected Institutions"
     search_clicked = st.button(action_label, type="primary", use_container_width=True)
@@ -6260,8 +6767,11 @@ if institutions:
         if not selected:
             st.error("Select at least one institution.")
             st.stop()
-        if manual_mode and any(not manual_sources.get(item.name) for item in selected):
-            st.error("Paste at least one valid faculty-page URL for every selected institution.")
+        if manual_mode and any(
+            not manual_sources.get(item.name) and not manual_visible_texts.get(item.name, "").strip()
+            for item in selected
+        ):
+            st.error("Provide a faculty-page URL or pasted visible directory results for every selected institution.")
             st.stop()
 
         all_contacts: list[Contact] = []
@@ -6314,6 +6824,7 @@ if institutions:
                         region_code=region_code,
                         region_kind=region_kind,
                         progress_callback=show_activity,
+                        visible_page_text=manual_visible_texts.get(institution.name, ""),
                     )
                 else:
                     contacts, report = process_institution(

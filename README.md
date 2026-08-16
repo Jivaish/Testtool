@@ -132,9 +132,16 @@ The recommended workflow is:
 5. Click **Extract Contacts from Faculty Pages**.
 
 Manual faculty-page mode verifies every supplied URL against the institution's official
-or officially linked affiliated domains. It reuses the same faculty-role, profile,
-published-email, deduplication, diagnostics, fallback-contact, and CSV rules as automatic
-mode, but skips broad page discovery and the independent web-search audit.
+or officially linked affiliated domains. It reuses the same profile, institutional-email,
+deduplication, diagnostics, fallback-contact, and CSV rules as automatic mode, but skips
+broad page discovery and the independent web-search audit. On an explicitly supplied
+directory, every visible named institutional contact is retained.
+
+For stateful public directories such as PeopleSoft, the app submits the visible public
+department-search form and follows the matching department result in the same session.
+When a directory keeps its result only in the user's browser cookies, copy the visible
+result page and paste it into **Visible directory results**; the manual extractor pairs
+each institutional email with the nearest person name and includes every visible contact.
 
 Institution discovery verifies the root website brand, academic or teaching-health
 identity, selected location, and selected-specialty evidence before showing a result.
