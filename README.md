@@ -2,10 +2,11 @@
 
 A ready-to-deploy Streamlit app for finding publicly visible official faculty work emails from universities, colleges, medical schools, teaching hospitals, health-science institutions, and academic centres.
 
-The app searches for answer-bearing official pages first, verifies the institution and
-selected location from that evidence, and then follows only relevant official program,
-department, directory, and profile pages. It does not use paid APIs, AI APIs, login-only
-data, third-party people databases, or guessed email patterns.
+The app first discovers verified institutions and displays their official website links.
+The default workflow lets the user paste one or more exact department faculty-page URLs
+for each institution; the app then extracts the roster, follows linked official profiles,
+verifies published emails, deduplicates the contacts, and organizes the output. An
+automatic website-search mode remains available as a secondary option.
 
 Public web discovery uses a pluggable search-provider layer backed by DDGS in automatic
 backend mode. It uses localized search regions when available and a global search region
@@ -119,7 +120,21 @@ Try:
 - State / Province / Region: `Alabama`
 - Department / Specialty: `Obstetrics and Gynecology`
 
-Then click **Discover Institutions**, select one or more institutions, and click **Search Selected Institutions**.
+Then click **Discover Institutions** and select one or more institutions. Use the default
+manual mode for supplied faculty pages, or switch to **Automatic website search**.
+
+The recommended workflow is:
+
+1. Click **Discover Institutions**.
+2. Open an institution's displayed official website.
+3. Navigate to the requested department's faculty, people, or provider page.
+4. Paste that URL under the institution. Multiple URLs can be supplied, one per line.
+5. Click **Extract Contacts from Faculty Pages**.
+
+Manual faculty-page mode verifies every supplied URL against the institution's official
+or officially linked affiliated domains. It reuses the same faculty-role, profile,
+published-email, deduplication, diagnostics, fallback-contact, and CSV rules as automatic
+mode, but skips broad page discovery and the independent web-search audit.
 
 Institution discovery verifies the root website brand, academic or teaching-health
 identity, selected location, and selected-specialty evidence before showing a result.

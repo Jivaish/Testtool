@@ -5365,6 +5365,254 @@ def extract_verified_evidence_contacts(
     return deduplicate_contacts(contacts), rejections, regional_program_verified
 
 
+def parse_manual_source_urls(value: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw_url in re.findall(r"https?://[^\s,;]+", value or "", flags=re.I):
+        normalized = normalize_url(raw_url.rstrip(".)]}>\"'"))
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            urls.append(normalized)
+    return urls
+
+
+def authorize_manual_source_domain(
+    institution: Institution,
+    source_url: str,
+    region: str,
+    terms: list[str],
+) -> bool:
+    if institution_related_domain(source_url, institution):
+        return True
+
+    target_root = organization_root(host_of(source_url))
+    if not target_root:
+        return False
+    evidence_urls = list(
+        dict.fromkeys(
+            url
+            for url in (
+                institution.evidence_url,
+                *institution.additional_evidence_urls,
+                institution.official_url,
+            )
+            if normalize_url(url)
+        )
+    )
+    for evidence_url in evidence_urls:
+        html, final_url, _ = fetch_html(make_session(), evidence_url)
+        if not html or not final_url or not institution_related_domain(final_url, institution):
+            continue
+        affiliates = discover_verified_specialty_affiliates(
+            BeautifulSoup(html, "html.parser"),
+            final_url,
+            institution,
+            region,
+            terms,
+        )
+        for affiliate_url, affiliate_host, _, _, _ in affiliates:
+            if organization_root(affiliate_host) != target_root:
+                continue
+            if affiliate_host not in institution.additional_hosts:
+                institution.additional_hosts.append(affiliate_host)
+            if affiliate_url not in institution.additional_evidence_urls:
+                institution.additional_evidence_urls.append(affiliate_url)
+            return institution_related_domain(source_url, institution)
+    return False
+
+
+def process_manual_faculty_pages(
+    institution: Institution,
+    source_urls: list[str],
+    country: str,
+    region: str,
+    specialty: str,
+    custom_keywords: str,
+    delay_seconds: float,
+    country_code: str = "",
+    region_code: str = "",
+    region_kind: str = "Region",
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[list[Contact], InstitutionReport]:
+    del country
+
+    def update_activity(message: str) -> None:
+        if progress_callback:
+            progress_callback(message)
+
+    terms = resolve_terms(specialty, custom_keywords)
+    report = InstitutionReport(
+        institution=institution.name,
+        status="Manual source review required",
+        official_url=institution.official_url,
+    )
+    report.notes.append("Manual faculty-page mode used; broad web discovery was skipped.")
+    session = make_session()
+    robots_text = fetch_robots_txt(session, institution.official_url)
+    disallowed_paths = parse_disallowed_paths(robots_text or "")
+    if robots_text:
+        report.notes.append("robots.txt checked")
+
+    accepted_pages: list[PageCandidate] = []
+    seed_cache: dict[str, str] = {}
+    for source_url in list(dict.fromkeys(normalize_url(url) for url in source_urls if normalize_url(url))):
+        update_activity("Opening supplied faculty page...")
+        if not authorize_manual_source_domain(institution, source_url, region, terms):
+            report.blocked_or_unreadable.append(
+                f"{source_url}: outside the institution's verified official or affiliated domains"
+            )
+            continue
+        if not path_allowed(source_url, disallowed_paths):
+            report.blocked_or_unreadable.append(f"{source_url}: skipped by robots.txt")
+            continue
+
+        if is_pdf_url(source_url):
+            page_text, error = fetch_pdf_text(session, source_url)
+            if not page_text:
+                report.blocked_or_unreadable.append(f"{source_url}: {error or 'unreadable PDF'}")
+                continue
+            final_url = source_url
+            title = urlparse(source_url).path.rsplit("/", 1)[-1]
+            html = ""
+            classification = "FACULTY_DIRECTORY" if "faculty" in fold_text(page_text[:5000]) else "SEARCH_RESULT"
+        else:
+            html, final_url, error = fetch_html(session, source_url)
+            if not html or not final_url:
+                report.blocked_or_unreadable.append(f"{source_url}: {error or 'unavailable'}")
+                continue
+            if not authorize_manual_source_domain(institution, final_url, region, terms):
+                report.blocked_or_unreadable.append(
+                    f"{source_url}: redirected outside verified institutional domains"
+                )
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+            page_text = clean_text(soup.get_text(" ", strip=True))
+            classification = classify_official_page(final_url, title, page_text, html)
+            seed_cache[final_url] = html
+
+        matched_terms = text_matches_terms(f"{final_url} {title} {page_text[:12000]}", terms)
+        faculty_identity = any(
+            marker in fold_text(f"{final_url} {title} {page_text[:5000]}")
+            for marker in (
+                "faculty", "academic staff", "our team", "people", "provider",
+                "physician", "professor", "department", "division", "researcher",
+            )
+        )
+        if not matched_terms or not faculty_identity:
+            report.rejections.append(
+                Rejection(
+                    institution.name,
+                    "Supplied page is not a faculty source for the requested specialty",
+                    final_url,
+                    title,
+                )
+            )
+            continue
+        if classification == "IRRELEVANT":
+            classification = "FACULTY_DIRECTORY"
+        accepted_pages.append(
+            PageCandidate(
+                final_url,
+                title,
+                matched_terms,
+                "manual_faculty_page",
+                relevance_score(final_url, title, page_text, terms),
+                classification,
+            )
+        )
+        report.notes.append(f"Accepted supplied faculty source: {final_url}")
+
+    accepted_pages = list({page.url: page for page in accepted_pages}.values())
+    report.department_pages = len(accepted_pages)
+    if not accepted_pages:
+        report.status = "No valid supplied faculty page"
+        return [], report
+
+    update_activity("Extracting the faculty roster...")
+    roster_entries, _, role_rejections, page_cache, crawl_log, blocked = discover_faculty_roster(
+        department_pages=accepted_pages,
+        institution=institution,
+        terms=terms,
+        delay_seconds=delay_seconds,
+        disallowed_paths=disallowed_paths,
+        seed_cache=seed_cache,
+    )
+    roster_entries = filter_roster_to_location(
+        roster_entries,
+        country_code,
+        region,
+        region_code,
+        region_kind,
+    )
+    report.faculty_roster_entries = len(roster_entries)
+    report.pages_checked = len(crawl_log)
+    report.rejections.extend(role_rejections)
+    report.blocked_or_unreadable.extend(blocked)
+    report.notes.extend(crawl_log)
+
+    update_activity("Checking faculty profiles and published emails...")
+    profile_links = discover_profile_links(page_cache, institution, roster_entries)
+    known_profile_urls = {normalize_url(str(link.get("url", ""))) for link in profile_links}
+    for page in accepted_pages:
+        if page.classification != "PERSON_PROFILE" or normalize_url(page.url) in known_profile_urls:
+            continue
+        profile_links.append(
+            {
+                "url": page.url,
+                "text": page.title,
+                "score": page.score,
+                "from": "supplied faculty profile",
+            }
+        )
+    profile_contacts, profile_rejections, profile_log, profile_blocked = crawl_profiles(
+        profile_links,
+        institution,
+        roster_entries,
+        delay_seconds,
+        disallowed_paths,
+    )
+    report.profiles_checked = len(profile_log)
+    report.rejections.extend(profile_rejections)
+    report.blocked_or_unreadable.extend(profile_blocked)
+    report.notes.extend(profile_log)
+
+    covered_names = {normalize_person_name(contact.name) for contact in profile_contacts}
+    card_contacts, card_rejections = extract_card_level_contacts(
+        roster_entries,
+        institution,
+        page_cache,
+        covered_names,
+    )
+    pdf_contacts, pdf_rejections = extract_pdf_contacts(accepted_pages, institution, terms)
+    report.rejections.extend(card_rejections)
+    report.rejections.extend(pdf_rejections)
+
+    contacts = deduplicate_contacts(profile_contacts + card_contacts + pdf_contacts)
+    update_activity(f"Finishing {institution.name}...")
+    if contacts:
+        report.contacts_found = len(contacts)
+        report.status = "Verified contacts found"
+        return contacts, report
+
+    department_contact = find_generic_department_email(
+        accepted_pages,
+        institution,
+        terms,
+        page_cache,
+    )
+    if department_contact:
+        report.contacts_found = 1
+        report.status = "Generic department contact found"
+        report.notes.append(
+            "No personal faculty emails were verified on the supplied sources; one department contact returned."
+        )
+        return [department_contact], report
+
+    report.status = "No public personal faculty email found"
+    return [], report
+
+
 def process_institution(
     institution: Institution,
     country: str,
@@ -5820,8 +6068,8 @@ st.markdown(
 )
 st.title(APP_NAME)
 st.markdown(
-    '<p class="small-note">Finds publicly visible official faculty work emails from official institutional sources only. '
-    'The final export contains exactly two columns: Name and Email.</p>',
+    '<p class="small-note">Discovers relevant institutions and extracts publicly visible faculty work emails from '
+    'official pages. The final export contains exactly two columns: Name and Email.</p>',
     unsafe_allow_html=True,
 )
 
@@ -5886,6 +6134,9 @@ if st.session_state.discovery_scope and st.session_state.discovery_scope != curr
     st.session_state.contacts = []
     st.session_state.reports = []
     st.session_state.discovery_scope = None
+    for state_key in list(st.session_state):
+        if state_key.startswith("manual_faculty_urls_"):
+            del st.session_state[state_key]
 
 if discover_clicked:
     if specialty == "Custom Department" and not custom_keywords.strip():
@@ -5910,10 +6161,13 @@ if discover_clicked:
         st.warning("No relevant institutions were verified from the available official sources.")
     st.session_state.institutions = institutions
     st.session_state.institution_log = institution_log
-    st.session_state.selected_institution_names = [item.name for item in institutions]
+    st.session_state.selected_institution_names = []
     st.session_state.contacts = []
     st.session_state.reports = []
     st.session_state.discovery_scope = current_scope
+    for state_key in list(st.session_state):
+        if state_key.startswith("manual_faculty_urls_"):
+            del st.session_state[state_key]
 
 institutions: list[Institution] = deduplicate_institutions(st.session_state.institutions)
 if institutions != st.session_state.institutions:
@@ -5924,7 +6178,25 @@ if institutions != st.session_state.institutions:
     ]
 if institutions:
     st.subheader("Discovered Institutions")
-    st.caption("Institution names are shown here. Official URLs are stored internally and visible in diagnostics.")
+    st.caption("Open an official website, locate its department faculty page, then paste that page below.")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Institution": item.name,
+                    "Official Website": item.official_url,
+                }
+                for item in institutions
+            ]
+        ),
+        column_config={
+            "Official Website": st.column_config.LinkColumn(
+                "Official Website",
+            )
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
     names = [item.name for item in institutions]
 
     btn_col_1, btn_col_2, _ = st.columns([1, 1, 3])
@@ -5939,17 +6211,57 @@ if institutions:
         name for name in st.session_state.selected_institution_names if name in names
     ]
     selected_names = st.multiselect(
-        "Choose institutions to search",
+        "Choose institutions",
         options=names,
         key="selected_institution_names",
     )
 
-    search_clicked = st.button("Search Selected Institutions", type="primary", use_container_width=True)
+    source_options = ["Paste faculty page links", "Automatic website search"]
+    if hasattr(st, "segmented_control"):
+        source_mode = st.segmented_control(
+            "Faculty source",
+            source_options,
+            default=source_options[0],
+            key="contact_source_mode",
+        )
+    else:
+        source_mode = st.radio(
+            "Faculty source",
+            source_options,
+            horizontal=True,
+            key="contact_source_mode",
+        )
+    source_mode = source_mode or source_options[0]
+    manual_mode = source_mode == source_options[0]
+
+    selected = [item for item in institutions if item.name in selected_names]
+    manual_sources: dict[str, list[str]] = {}
+    if manual_mode:
+        for institution in selected:
+            widget_key = f"manual_faculty_urls_{slugify(institution.name)}"
+            with st.expander(institution.name, expanded=len(selected) <= 3):
+                st.link_button(
+                    "Open official website",
+                    institution.official_url,
+                    use_container_width=True,
+                )
+                raw_sources = st.text_area(
+                    "Faculty page URL(s), one per line",
+                    key=widget_key,
+                    height=90,
+                    placeholder="https://university.edu/department/faculty",
+                )
+                manual_sources[institution.name] = parse_manual_source_urls(raw_sources)
+
+    action_label = "Extract Contacts from Faculty Pages" if manual_mode else "Search Selected Institutions"
+    search_clicked = st.button(action_label, type="primary", use_container_width=True)
 
     if search_clicked:
-        selected = [item for item in institutions if item.name in selected_names]
         if not selected:
             st.error("Select at least one institution.")
+            st.stop()
+        if manual_mode and any(not manual_sources.get(item.name) for item in selected):
+            st.error("Paste at least one valid faculty-page URL for every selected institution.")
             st.stop()
 
         all_contacts: list[Contact] = []
@@ -5959,9 +6271,16 @@ if institutions:
             "Website blocked automated access",
             "JavaScript-only directory",
             "Manual review required",
+            "Manual source review required",
+            "No valid supplied faculty page",
         }
 
-        with st.status("🔍 Searching university websites...", expanded=True) as search_status:
+        status_label = (
+            "Reviewing supplied faculty pages..."
+            if manual_mode
+            else "Searching university websites..."
+        )
+        with st.status(status_label, expanded=True) as search_status:
             completed_feed = st.container()
             current_panel = st.empty()
             next_panel = st.empty()
@@ -5982,25 +6301,41 @@ if institutions:
                 def show_activity(message: str, panel=activity_panel) -> None:
                     panel.caption(message)
 
-                contacts, report = process_institution(
-                    institution=institution,
-                    country=country,
-                    region=region,
-                    specialty=specialty,
-                    custom_keywords=custom_keywords,
-                    delay_seconds=delay_seconds,
-                    country_code=country_code,
-                    region_code=region_code,
-                    region_kind=region_kind,
-                    progress_callback=show_activity,
-                )
+                if manual_mode:
+                    contacts, report = process_manual_faculty_pages(
+                        institution=institution,
+                        source_urls=manual_sources[institution.name],
+                        country=country,
+                        region=region,
+                        specialty=specialty,
+                        custom_keywords=custom_keywords,
+                        delay_seconds=delay_seconds,
+                        country_code=country_code,
+                        region_code=region_code,
+                        region_kind=region_kind,
+                        progress_callback=show_activity,
+                    )
+                else:
+                    contacts, report = process_institution(
+                        institution=institution,
+                        country=country,
+                        region=region,
+                        specialty=specialty,
+                        custom_keywords=custom_keywords,
+                        delay_seconds=delay_seconds,
+                        country_code=country_code,
+                        region_code=region_code,
+                        region_kind=region_kind,
+                        progress_callback=show_activity,
+                    )
                 all_contacts.extend(contacts)
                 reports.append(report)
                 current_panel.empty()
 
                 page_word = "page" if report.department_pages == 1 else "pages"
                 if report.status in failure_statuses:
-                    completed_feed.warning(f"⚠️ {institution.name} — search failed: {report.status}")
+                    failed_action = "extraction failed" if manual_mode else "search failed"
+                    completed_feed.warning(f"⚠️ {institution.name} — {failed_action}: {report.status}")
                 else:
                     completed_feed.success(
                         f"✅ {institution.name} — {report.department_pages} relevant {page_word} found"
@@ -6013,8 +6348,10 @@ if institutions:
             next_panel.empty()
             elapsed = time.perf_counter() - started_at
             total_pages = sum(report.department_pages for report in reports)
-            search_status.update(label="🎉 Search complete!", state="complete", expanded=True)
-            st.success(f"✅ {len(reports)} institutions searched")
+            completion_label = "Extraction complete!" if manual_mode else "Search complete!"
+            search_status.update(label=completion_label, state="complete", expanded=True)
+            completion_action = "processed" if manual_mode else "searched"
+            st.success(f"{len(reports)} institutions {completion_action}")
             st.caption(f"📄 {total_pages} relevant pages found")
             st.caption(f"⏱️ Completed in {format_elapsed(elapsed)}")
 
@@ -6029,6 +6366,8 @@ if reports:
         "Website blocked automated access",
         "JavaScript-only directory",
         "Manual review required",
+        "Manual source review required",
+        "No valid supplied faculty page",
     }
     summary_values = {
         "Institutions Searched": len(reports),
