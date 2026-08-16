@@ -1,12 +1,12 @@
 # Global Medical Faculty Contact Finder
 
-A ready-to-deploy Streamlit app for finding publicly visible official faculty work emails from universities, colleges, medical schools, teaching hospitals, health-science institutions, and academic centres.
+A ready-to-deploy Streamlit app for building complete faculty rosters and enriching them with publicly visible official work emails and phone numbers from universities, colleges, medical schools, teaching hospitals, health-science institutions, and academic centres.
 
 The app first discovers verified institutions and displays their official website links.
 The default workflow lets the user paste one or more exact department faculty-page URLs
 for each institution; the app then renders dynamic directories, follows pagination and
 lazy-loaded results to their natural end, extracts the roster, follows linked official profiles,
-verifies published emails and phones, deduplicates the contacts, and organizes the output. An
+verifies published emails and phones, reconciles every person back to the roster, and organizes the output. Faculty remain in the result when an email or phone is not published. An
 automatic website-search mode remains available as a secondary option.
 
 Public web discovery uses a pluggable search-provider layer backed by DDGS in automatic
@@ -36,39 +36,44 @@ Country selection uses the full ISO country list. The location dropdown combines
 
 ## Output
 
-The final table and downloadable CSV contain three columns. Phone is left blank when it is not published:
+The final table and downloadable CSV are roster-first. Contact fields remain blank when they are not publicly published:
 
 ```text
-Name,Email,Phone
+Name,Title,Email,Phone,Profile,Institution,Department,Directory URL,
+Name Source URL,Email Source URL,Phone Source URL,Profile Status,
+Email Status,Phone Status
 ```
 
-If one verified faculty member has two different publicly visible official institutional emails, the app keeps two rows. Generic department fallback emails are never assigned to faculty members.
+Each person has one reconciled faculty record. Duplicate directory or profile appearances are merged by institution, normalized name, and profile identity; two different people who share a name are not merged when their profile URLs differ. Generic department fallback emails are never assigned to faculty members.
 
 ## Accuracy Rule
 
-Accuracy is prioritized over quantity. A contact is returned only when:
+Accuracy means both roster completeness and contact provenance:
 
 - the person is associated with the selected department or a directly related academic unit,
-- the person appears to be current faculty, academic teaching staff, or an eligible academic researcher,
-- the email is visibly published on an official institutional teaching source,
+- every valid person on a user-supplied authoritative faculty directory is retained, even when title, email, or phone is unavailable,
+- automatic discovery requires faculty, academic teaching staff, or eligible academic-research evidence,
+- any email is visibly published on an official institutional teaching source,
 - the email is an institutional work email, or a professional affiliate email explicitly
   published beside the faculty member on that verified teaching source,
-- the name and email are locally associated on a profile, card, directory row, official PDF, or similar source.
-- any phone number is taken only from the same local person card or profile as the email.
+- the name and contact fields are locally associated on a profile, card, directory row, official PDF, or similar source,
+- any phone number is taken only from the same local person card or profile,
+- directory, name, email, phone, profile, and extraction-status provenance remain available in diagnostics and CSV output.
 
 The app never guesses, generates, constructs, infers, or predicts emails from names.
 
 For every selected institution, the crawler expands the specialty into related academic
-units, classifies official pages, builds a candidate-person pool, visits available
-profiles, verifies displayed email evidence, deduplicates contacts, and runs an
+units, classifies official pages, builds an authoritative or evidence-filtered roster, visits every discovered
+profile, verifies displayed contact evidence, reconciles the enriched records, and runs an
 independent second-pass audit. A low initial yield triggers the same broader audit rather
 than an early zero-result conclusion. Diagnostics retain discovered URLs, page
-classification, acceptance/rejection reasons, profile and email-source URLs, relevance
-evidence, and confidence.
+classification, acceptance/rejection reasons, directory counts, unique-faculty counts,
+profile attempts/successes/failures, with/without-email and with/without-phone counts,
+duplicate merges, missing people, field source URLs, relevance evidence, and confidence.
 
 ## No-Public-Email Fallback
 
-If no verified personal faculty email is available, the app first returns one publicly
+If no faculty roster can be extracted and no verified personal faculty email is available, the app first returns one publicly
 published generic contact for the verified department, such as:
 
 ```text
@@ -136,9 +141,10 @@ The recommended workflow is:
 
 Manual faculty-page mode verifies every supplied URL against the institution's official
 or officially linked affiliated domains. It reuses the same profile, institutional-email,
-deduplication, diagnostics, fallback-contact, and CSV rules as automatic mode, but skips
+reconciliation, diagnostics, fallback-contact, and CSV rules as automatic mode, but skips
 broad page discovery and the independent web-search audit. On an explicitly supplied
-directory, every visible named institutional contact is retained.
+directory, every valid named roster member is retained. Emails and phones are optional
+enrichment fields, never admission requirements for the final roster.
 
 For stateful public directories such as PeopleSoft, the app submits the visible public
 department-search form and follows the matching department result in the same session.

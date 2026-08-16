@@ -787,10 +787,12 @@ class FacultyEntry:
     source_url: str
     evidence: str = ""
     profile_url: str | None = None
+    phone: str = ""
+    confidence: int = 0
 
 
 @dataclass
-class Contact:
+class FacultyRecord:
     name: str
     email: str
     institution: str
@@ -802,19 +804,62 @@ class Contact:
     relevance_evidence: str = ""
     confidence: str = ""
     phone: str = ""
+    department: str = ""
+    title: str = ""
+    directory_url: str = ""
+    name_source_url: str = ""
+    phone_source_url: str = ""
+    profile_status: str = ""
+    email_status: str = ""
+    phone_status: str = ""
 
     def __post_init__(self) -> None:
+        self.name = clean_text(self.name)
+        self.email = clean_text(self.email).casefold()
+        self.phone = clean_text(self.phone)
         if not self.email_source_url:
-            self.email_source_url = self.source_url
+            self.email_source_url = self.source_url if self.email else ""
+        if not self.phone_source_url:
+            self.phone_source_url = self.source_url if self.phone else ""
+        if not self.name_source_url:
+            self.name_source_url = self.directory_url or self.source_url
+        if not self.directory_url and "directory" in self.method.casefold():
+            self.directory_url = self.source_url
         if not self.profile_url and "profile" in self.method.casefold():
             self.profile_url = self.source_url
         if not self.relevance_evidence:
             self.relevance_evidence = self.method
         if not self.confidence:
             self.confidence = "HIGH" if self.strength == 0 else "MEDIUM"
+        if not self.profile_status:
+            self.profile_status = "PROFILE_DISCOVERED" if self.profile_url else "NO_PROFILE_URL"
+        if not self.email_status:
+            self.email_status = "PUBLIC_EMAIL_FOUND" if self.email else "NO_PUBLIC_EMAIL"
+        if not self.phone_status:
+            self.phone_status = "PUBLIC_PHONE_FOUND" if self.phone else "NO_PUBLIC_PHONE"
 
     def final_row(self) -> dict[str, str]:
-        return {"Name": self.name, "Email": self.email, "Phone": self.phone}
+        return {
+            "Name": self.name,
+            "Title": self.title,
+            "Email": self.email,
+            "Phone": self.phone,
+            "Profile": self.profile_url,
+            "Institution": self.institution,
+            "Department": self.department,
+            "Directory URL": self.directory_url,
+            "Name Source URL": self.name_source_url,
+            "Email Source URL": self.email_source_url,
+            "Phone Source URL": self.phone_source_url,
+            "Profile Status": self.profile_status,
+            "Email Status": self.email_status,
+            "Phone Status": self.phone_status,
+        }
+
+
+# Backward-compatible name for existing extraction helpers. A Contact is now a
+# complete faculty record whose published contact fields may legitimately be blank.
+Contact = FacultyRecord
 
 
 @dataclass
@@ -835,6 +880,20 @@ class InstitutionReport:
     pages_checked: int = 0
     profiles_checked: int = 0
     contacts_found: int = 0
+    directory_entries_discovered: int = 0
+    unique_faculty: int = 0
+    profile_urls_discovered: int = 0
+    profile_requests_attempted: int = 0
+    profile_requests_succeeded: int = 0
+    profile_requests_failed: int = 0
+    final_faculty_records: int = 0
+    with_email: int = 0
+    without_email: int = 0
+    with_phone: int = 0
+    without_phone: int = 0
+    duplicates_merged: int = 0
+    directory_urls: list[str] = field(default_factory=list)
+    missing_people: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     blocked_or_unreadable: list[str] = field(default_factory=list)
     rejections: list[Rejection] = field(default_factory=list)
@@ -848,7 +907,17 @@ class InstitutionReport:
             "Roster Entries": self.faculty_roster_entries,
             "Pages Checked": self.pages_checked,
             "Profiles Checked": self.profiles_checked,
-            "Contacts": self.contacts_found,
+            "Profile URLs": self.profile_urls_discovered,
+            "Profile Attempts": self.profile_requests_attempted,
+            "Profile Successes": self.profile_requests_succeeded,
+            "Profile Failures": self.profile_requests_failed,
+            "Faculty Found": self.final_faculty_records,
+            "With Email": self.with_email,
+            "Without Email": self.without_email,
+            "With Phone": self.with_phone,
+            "Without Phone": self.without_phone,
+            "Duplicates Merged": self.duplicates_merged,
+            "Missing People": len(self.missing_people),
             "Notes": "; ".join(self.notes[:6]),
         }
 
@@ -3991,10 +4060,123 @@ def faculty_candidate_nodes(soup: BeautifulSoup) -> list[Tag]:
     return nodes
 
 
-def extract_roster_entries_from_soup(page_url: str, soup: BeautifulSoup) -> tuple[list[FacultyEntry], list[Rejection]]:
+def profile_url_from_person_node(node: Tag, page_url: str) -> str | None:
+    """Find a profile attached to a person card, including image/generic/data links."""
+    candidates: list[tuple[int, str]] = []
+    elements: list[Tag] = [node, *node.find_all(True)]
+    for element in elements:
+        raw_targets: list[str] = []
+        if element.name == "a":
+            raw_targets.append(clean_text(element.get("href")))
+        for attribute in ("data-href", "data-url", "data-link", "data-profile", "data-profile-url"):
+            raw_targets.append(clean_text(element.get(attribute)))
+        onclick = clean_text(element.get("onclick"))
+        raw_targets.extend(
+            match.group(1)
+            for match in re.finditer(r"(?:location(?:\.href)?\s*=|open\s*\()\s*['\"]([^'\"]+)", onclick, flags=re.I)
+        )
+        label = clean_text(element.get_text(" ", strip=True))
+        for raw_target in raw_targets:
+            if not raw_target or raw_target.casefold().startswith(("mailto:", "tel:", "javascript:", "#")):
+                continue
+            target = normalize_url(urljoin(page_url, raw_target))
+            if not target or organization_root(host_of(target)) != organization_root(host_of(page_url)):
+                continue
+            score = 0
+            if looks_like_profile_url(target, label):
+                score += 80
+            if valid_name(clean_name(label)):
+                score += 40
+            if any(marker in label.casefold() for marker in ("view profile", "read more", "biography", "bio")):
+                score += 30
+            if element.find("img") or element.name == "img":
+                score += 15
+            if score:
+                candidates.append((score, target))
+    return max(candidates, default=(0, ""), key=lambda item: item[0])[1] or None
+
+
+def merge_faculty_entries(entries: list[FacultyEntry]) -> list[FacultyEntry]:
+    merged: list[FacultyEntry] = []
+    for entry in entries:
+        same_name = [item for item in merged if item.normalized_name == entry.normalized_name]
+        target = next(
+            (
+                item
+                for item in same_name
+                if item.profile_url and entry.profile_url
+                and normalize_url(item.profile_url) == normalize_url(entry.profile_url)
+            ),
+            None,
+        )
+        if target is None:
+            target = next(
+                (item for item in same_name if not item.profile_url or not entry.profile_url),
+                None,
+            )
+        if target is None:
+            merged.append(entry)
+            continue
+        if not target.profile_url and entry.profile_url:
+            target.profile_url = entry.profile_url
+        if not target.title and entry.title:
+            target.title = entry.title
+        if not target.phone and entry.phone:
+            target.phone = entry.phone
+        if len(entry.evidence) > len(target.evidence):
+            target.evidence = entry.evidence
+        target.confidence = max(target.confidence, entry.confidence)
+    return merged
+
+
+def extract_person_selector_entries(page_url: str, soup: BeautifulSoup) -> list[FacultyEntry]:
+    """Read JS-backed directories that expose their roster in a person selector."""
+    entries: list[FacultyEntry] = []
+    for select in soup.select("select"):
+        options = select.select("option[value]")
+        candidates: list[FacultyEntry] = []
+        for option in options:
+            raw_name = clean_text(option.get_text(" ", strip=True))
+            if raw_name.count(",") == 1:
+                surname, given_names = (part.strip() for part in raw_name.split(",", 1))
+                raw_name = f"{given_names} {surname}"
+            name = clean_name(raw_name)
+            raw_target = clean_text(option.get("value"))
+            target = normalize_url(urljoin(page_url, raw_target))
+            if not (valid_name(name) and target):
+                continue
+            if organization_root(host_of(target)) != organization_root(host_of(page_url)):
+                continue
+            if not looks_like_profile_url(target, name):
+                continue
+            candidates.append(
+                FacultyEntry(
+                    name=name,
+                    normalized_name=normalize_person_name(name),
+                    title="",
+                    source_url=page_url,
+                    evidence=f"Official directory selector: {name}",
+                    profile_url=target,
+                    confidence=95,
+                )
+            )
+        populated_options = sum(bool(clean_text(option.get("value"))) for option in options)
+        if len(candidates) >= 5 and len(candidates) >= max(5, populated_options // 2):
+            entries.extend(candidates)
+    return merge_faculty_entries(entries)
+
+
+def extract_roster_entries_from_soup(
+    page_url: str,
+    soup: BeautifulSoup,
+    authoritative: bool = False,
+) -> tuple[list[FacultyEntry], list[Rejection]]:
     entries: list[FacultyEntry] = []
     rejections: list[Rejection] = []
-    entries_by_name: dict[str, FacultyEntry] = {}
+    selector_entries = extract_person_selector_entries(page_url, soup)
+    if authoritative and selector_entries:
+        return selector_entries, rejections
+    entries.extend(selector_entries)
 
     for node in faculty_candidate_nodes(soup):
         text = clean_text(node.get_text(" ", strip=True))
@@ -4003,36 +4185,30 @@ def extract_roster_entries_from_soup(page_url: str, soup: BeautifulSoup) -> tupl
         name = extract_name_from_node(node)
         if not name:
             continue
+        if authoritative and len(collect_names_in_node(node)) != 1:
+            continue
         title_text = extract_title_text(node, text, name)
         reason = excluded_role_reason(title_text)
         allowed = matched_allowed_title(title_text)
-        if reason or not allowed:
+        if not authoritative and (reason or not allowed):
             if reason:
                 rejections.append(Rejection(name=name, reason=reason, source_url=page_url, detail=title_text[:220]))
             continue
         normalized = normalize_person_name(name)
-        profile_url = None
-        for anchor in node.find_all("a", href=True):
-            target = normalize_url(urljoin(page_url, anchor.get("href", "")))
-            if target and looks_like_profile_url(target, anchor.get_text(" ", strip=True)):
-                profile_url = target
-                break
-        existing = entries_by_name.get(normalized)
-        if existing:
-            if not existing.profile_url and profile_url:
-                existing.profile_url = profile_url
-            continue
+        profile_url = profile_url_from_person_node(node, page_url)
+        display_title = allowed.title() if allowed else clean_text(title_text[:220])
         entry = FacultyEntry(
             name=name,
             normalized_name=normalized,
-            title=allowed.title(),
+            title=display_title,
             source_url=page_url,
             evidence=text[:2000],
             profile_url=profile_url,
+            phone=extract_phone_from_node(node),
+            confidence=100 if authoritative else 80,
         )
         entries.append(entry)
-        entries_by_name[normalized] = entry
-    return entries, rejections
+    return merge_faculty_entries(entries), rejections
 
 
 def discover_faculty_roster(
@@ -4043,12 +4219,13 @@ def discover_faculty_roster(
     disallowed_paths: list[str],
     seed_cache: dict[str, str] | None = None,
     allow_browser_traversal: bool = True,
+    authoritative_roster: bool = False,
 ) -> tuple[list[FacultyEntry], list[str], list[Rejection], dict[str, str], list[str], list[str]]:
     queue: deque[str] = deque()
     scheduled: set[str] = set()
     visited: set[str] = set()
     seen_content: set[tuple[int, str, str]] = set()
-    roster: dict[str, FacultyEntry] = {}
+    roster: list[FacultyEntry] = []
     faculty_pages: list[str] = []
     rejections: list[Rejection] = []
     page_cache: dict[str, str] = dict(seed_cache or {})
@@ -4168,12 +4345,16 @@ def discover_faculty_roster(
                     faculty_pages.append(final_url)
 
                 page_has_terms = bool(text_matches_terms(f"{final_url} {title} {page_text}", terms))
-                if page_has_terms:
-                    found_entries, found_rejections = extract_roster_entries_from_soup(final_url, soup)
+                if page_has_terms or authoritative_roster:
+                    found_entries, found_rejections = extract_roster_entries_from_soup(
+                        final_url,
+                        soup,
+                        authoritative=authoritative_roster,
+                    )
                     department_scoped = page_is_department_scoped(final_url, title, terms)
                     for entry in found_entries:
-                        if department_scoped or text_matches_terms(entry.evidence, terms):
-                            roster.setdefault(entry.normalized_name, entry)
+                        if authoritative_roster or department_scoped or text_matches_terms(entry.evidence, terms):
+                            roster = merge_faculty_entries([*roster, entry])
                         else:
                             rejections.append(
                                 Rejection(entry.name, "Outside requested department", final_url, entry.title)
@@ -4200,7 +4381,7 @@ def discover_faculty_roster(
 
                 log.append(f"[{len(visited)} checked] {final_url}")
 
-    return list(roster.values()), sorted(set(faculty_pages)), rejections, page_cache, log, blocked
+    return merge_faculty_entries(roster), sorted(set(faculty_pages)), rejections, page_cache, log, blocked
 
 
 def filter_roster_to_location(
@@ -4251,6 +4432,29 @@ def discover_profile_links(
     links: dict[str, dict[str, object]] = {}
     for page_url, html in page_cache.items():
         soup = BeautifulSoup(html, "html.parser")
+        for node in faculty_candidate_nodes(soup):
+            node_name = extract_name_from_node(node)
+            if not node_name or len(collect_names_in_node(node)) != 1:
+                continue
+            matching_entries = [
+                entry
+                for entry in roster_entries
+                if roster_name_match(node_name, {entry.normalized_name})
+            ]
+            if len(matching_entries) != 1:
+                continue
+            target = profile_url_from_person_node(node, page_url)
+            if not target or not institution_related_domain(target, institution):
+                continue
+            entry = matching_entries[0]
+            if not entry.profile_url:
+                entry.profile_url = target
+            links[target] = {
+                "url": target,
+                "text": entry.name,
+                "score": 95,
+                "from": page_url,
+            }
         for anchor in soup.find_all("a", href=True):
             target = normalize_url(urljoin(page_url, anchor.get("href", "")))
             text = clean_text(anchor.get_text(" ", strip=True))
@@ -4854,37 +5058,250 @@ def find_institution_conference_contact(
 # 13. Deduplication
 # ==================================================
 
+def merge_faculty_record_fields(target: FacultyRecord, source: FacultyRecord) -> FacultyRecord:
+    source_is_stronger = source.strength < target.strength
+    if source_is_stronger and source.email:
+        target.email = source.email
+        target.email_source_url = source.email_source_url or source.source_url
+        target.method = source.method
+        target.source_url = source.source_url
+        target.strength = source.strength
+        target.confidence = source.confidence
+    elif not target.email and source.email:
+        target.email = source.email
+        target.email_source_url = source.email_source_url or source.source_url
+    if not target.phone and source.phone:
+        target.phone = source.phone
+        target.phone_source_url = source.phone_source_url or source.source_url
+    if not target.profile_url and source.profile_url:
+        target.profile_url = source.profile_url
+    if not target.title and source.title:
+        target.title = source.title
+    if not target.department and source.department:
+        target.department = source.department
+    if not target.directory_url and source.directory_url:
+        target.directory_url = source.directory_url
+    if not target.name_source_url and source.name_source_url:
+        target.name_source_url = source.name_source_url
+    if len(source.name) > len(target.name) and normalize_person_name(source.name) == normalize_person_name(target.name):
+        target.name = source.name
+    if source.profile_status in {"PROFILE_VISITED", "PROFILE_FETCH_FAILED", "PROFILE_BLOCKED"}:
+        target.profile_status = source.profile_status
+    elif target.profile_status == "NO_PROFILE_URL" and target.profile_url:
+        target.profile_status = "PROFILE_DISCOVERED"
+    target.email_status = "PUBLIC_EMAIL_FOUND" if target.email else "NO_PUBLIC_EMAIL"
+    target.phone_status = "PUBLIC_PHONE_FOUND" if target.phone else "NO_PUBLIC_PHONE"
+    return target
+
+
 def deduplicate_contacts(contacts: list[Contact]) -> list[Contact]:
-    by_email: dict[str, Contact] = {}
+    """Merge by institution/person identity without collapsing blank-email people."""
+    merged: list[FacultyRecord] = []
     for contact in contacts:
-        email_key = contact.email.strip().lower()
-        existing = by_email.get(email_key)
-        if not existing:
-            by_email[email_key] = contact
+        if not clean_text(contact.name):
             continue
-        preferred = contact if contact.strength < existing.strength else existing
-        alternate = existing if preferred is contact else contact
-        if not preferred.phone and alternate.phone:
-            preferred.phone = alternate.phone
-        by_email[email_key] = preferred
+        normalized_name = normalize_person_name(contact.name)
+        institution_key = fold_text(contact.institution)
+        same_name = [
+            item
+            for item in merged
+            if fold_text(item.institution) == institution_key
+            and normalize_person_name(item.name) == normalized_name
+        ]
+        target = next(
+            (
+                item
+                for item in same_name
+                if item.profile_url and contact.profile_url
+                and normalize_url(item.profile_url) == normalize_url(contact.profile_url)
+            ),
+            None,
+        )
+        if target is None and contact.email:
+            target = next(
+                (item for item in same_name if item.email and item.email.casefold() == contact.email.casefold()),
+                None,
+            )
+        if target is None and len(same_name) == 1 and (
+            not same_name[0].profile_url or not contact.profile_url
+        ):
+            target = same_name[0]
+        if target is None:
+            merged.append(contact)
+        else:
+            merge_faculty_record_fields(target, contact)
+    return sorted(
+        merged,
+        key=lambda item: (
+            item.institution.casefold(),
+            item.name.casefold(),
+            item.profile_url.casefold(),
+            item.email.casefold(),
+        ),
+    )
 
-    by_exact_row: dict[tuple[str, str], Contact] = {}
-    for contact in by_email.values():
-        key = (normalize_person_name(contact.name), contact.email.strip().lower())
-        existing = by_exact_row.get(key)
-        if not existing or contact.strength < existing.strength:
-            by_exact_row[key] = contact
 
-    return sorted(by_exact_row.values(), key=lambda item: (item.name.casefold(), item.email.casefold()))
+def faculty_record_from_entry(
+    entry: FacultyEntry,
+    institution: Institution,
+    department: str,
+) -> FacultyRecord:
+    return FacultyRecord(
+        name=entry.name,
+        email="",
+        institution=institution.name,
+        source_url=entry.source_url,
+        method="Authoritative faculty roster",
+        strength=3,
+        profile_url=entry.profile_url or "",
+        phone=entry.phone,
+        department=department,
+        title=entry.title,
+        directory_url=entry.source_url,
+        name_source_url=entry.source_url,
+        phone_source_url=entry.source_url if entry.phone else "",
+        profile_status="PROFILE_DISCOVERED" if entry.profile_url else "NO_PROFILE_URL",
+        confidence="HIGH" if entry.confidence >= 100 else "MEDIUM",
+    )
+
+
+def reconcile_faculty_records(
+    roster_entries: list[FacultyEntry],
+    enriched_records: list[Contact],
+    institution: Institution,
+    department: str,
+    report: InstitutionReport,
+    profile_links: list[dict[str, object]] | None = None,
+    profile_log: list[str] | None = None,
+    profile_blocked: list[str] | None = None,
+    authoritative_roster: bool = False,
+) -> list[FacultyRecord]:
+    if authoritative_roster and roster_entries:
+        approved_records: list[Contact] = []
+        for record in enriched_records:
+            candidates = [
+                entry
+                for entry in roster_entries
+                if entry.normalized_name == normalize_person_name(record.name)
+            ]
+            matching_profile = bool(
+                record.profile_url
+                and any(
+                    entry.profile_url
+                    and normalize_url(entry.profile_url) == normalize_url(record.profile_url)
+                    for entry in candidates
+                )
+            )
+            if not candidates:
+                report.rejections.append(
+                    Rejection(
+                        record.name,
+                        "OUTSIDE_AUTHORITATIVE_ROSTER",
+                        record.source_url,
+                        record.email,
+                    )
+                )
+                continue
+            if len(candidates) > 1 and not matching_profile:
+                report.rejections.append(
+                    Rejection(
+                        record.name,
+                        "AMBIGUOUS_SAME_NAME_RECORD",
+                        record.source_url,
+                        record.email,
+                    )
+                )
+                continue
+            if record.profile_url and all(entry.profile_url for entry in candidates) and not matching_profile:
+                report.rejections.append(
+                    Rejection(
+                        record.name,
+                        "PROFILE_NOT_ON_AUTHORITATIVE_ROSTER",
+                        record.source_url,
+                        record.profile_url,
+                    )
+                )
+                continue
+            approved_records.append(record)
+        enriched_records = approved_records
+
+    roster_records = [
+        faculty_record_from_entry(entry, institution, department)
+        for entry in roster_entries
+    ]
+    inputs = [*roster_records, *enriched_records]
+    records = deduplicate_contacts(inputs)
+    report.duplicates_merged += max(0, len(inputs) - len(records))
+
+    attempted_urls = {
+        normalize_url(str(link.get("url", "")))
+        for link in (profile_links or [])
+        if normalize_url(str(link.get("url", "")))
+    }
+    failed_urls = {
+        normalize_url(item.split(": ", 1)[0])
+        for item in (profile_blocked or [])
+        if normalize_url(item.split(": ", 1)[0])
+    }
+    for record in records:
+        normalized_profile = normalize_url(record.profile_url)
+        if normalized_profile in failed_urls:
+            record.profile_status = "PROFILE_FETCH_FAILED"
+        elif normalized_profile in attempted_urls:
+            record.profile_status = "PROFILE_VISITED"
+        elif record.profile_url:
+            record.profile_status = "PROFILE_DISCOVERED"
+        else:
+            record.profile_status = "NO_PROFILE_URL"
+        record.email_status = "PUBLIC_EMAIL_FOUND" if record.email else "NO_PUBLIC_EMAIL"
+        record.phone_status = "PUBLIC_PHONE_FOUND" if record.phone else "NO_PUBLIC_PHONE"
+
+    roster_names = {entry.normalized_name for entry in roster_entries}
+    final_names = {normalize_person_name(record.name) for record in records}
+    report.missing_people = sorted(roster_names - final_names)
+    report.directory_entries_discovered = len(roster_entries)
+    report.unique_faculty = len(merge_faculty_entries(list(roster_entries)))
+    report.profile_urls_discovered += len(attempted_urls)
+    report.profile_requests_attempted += len(attempted_urls)
+    report.profile_requests_failed += len(failed_urls)
+    report.profile_requests_succeeded += max(0, len(attempted_urls) - len(failed_urls))
+    report.profiles_checked = report.profile_requests_attempted
+    report.final_faculty_records = len(records)
+    report.with_email = sum(bool(record.email) for record in records)
+    report.without_email = len(records) - report.with_email
+    report.with_phone = sum(bool(record.phone) for record in records)
+    report.without_phone = len(records) - report.with_phone
+    report.contacts_found = report.with_email
+    if report.missing_people:
+        report.notes.append(
+            f"Completeness warning: {len(report.missing_people)} faculty disappeared during processing."
+        )
+        for missing_name in report.missing_people:
+            report.rejections.append(
+                Rejection(missing_name, "MISSING_AFTER_RECONCILIATION", institution.official_url)
+            )
+    else:
+        report.notes.append(
+            f"Completeness reconciled: {len(roster_entries)} roster entries produced "
+            f"{len(records)} final faculty record(s)."
+        )
+    return records
+
+
+FINAL_COLUMNS = [
+    "Name", "Title", "Email", "Phone", "Profile", "Institution", "Department",
+    "Directory URL", "Name Source URL", "Email Source URL", "Phone Source URL",
+    "Profile Status", "Email Status", "Phone Status",
+]
 
 
 def final_dataframe(contacts: list[Contact]) -> pd.DataFrame:
     rows = [contact.final_row() for contact in deduplicate_contacts(contacts)]
-    frame = pd.DataFrame(rows, columns=["Name", "Email", "Phone"])
+    frame = pd.DataFrame(rows, columns=FINAL_COLUMNS)
     if frame.empty:
         return frame
     frame = frame.fillna("")
-    frame = frame[(frame["Name"].str.strip() != "") & (frame["Email"].str.strip() != "")]
+    frame = frame[frame["Name"].str.strip() != ""]
     frame = frame.drop_duplicates().sort_values(["Name", "Email"], kind="stable")
     return frame.reset_index(drop=True)
 
@@ -4967,6 +5384,13 @@ def parse_profile_page(
         None,
     )
     display_name = matched_entry.name if matched_entry else clean_name(name)
+    profile_title = matched_entry.title if matched_entry else ""
+    for selector in ("[itemprop='jobTitle']", *TITLE_SELECTORS):
+        title_element = soup.select_one(selector)
+        candidate_title = clean_text(title_element.get_text(" ", strip=True)) if title_element else ""
+        if candidate_title:
+            profile_title = candidate_title[:220]
+            break
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
     profile_phone = next(
@@ -4977,7 +5401,7 @@ def parse_profile_page(
             for value in values
             if (normalized := normalize_phone(value))
         ),
-        extract_phone_from_text(page_text),
+        extract_phone_from_node(soup) or extract_phone_from_text(page_text),
     )
     contexts = extract_emails_with_context(soup, page_text)
     for email in protected_emails:
@@ -4993,7 +5417,11 @@ def parse_profile_page(
         if not is_displayed_contact(occurrences):
             rejections.append(Rejection(display_name, "Email not shown as a contact field", url, email))
             continue
-        ok, reason = classify_institution_email(email, institution)
+        ok, reason = classify_institution_email(
+            email,
+            institution,
+            allow_published_affiliate=True,
+        )
         if ok:
             contacts.append(
                 Contact(
@@ -5003,13 +5431,38 @@ def parse_profile_page(
                     url,
                     "Official personal profile",
                     0,
+                    profile_url=url,
                     phone=profile_phone,
+                    department="",
+                    title=profile_title,
+                    directory_url=matched_entry.source_url if matched_entry else "",
+                    name_source_url=url,
+                    email_source_url=url,
+                    phone_source_url=url if profile_phone else "",
+                    profile_status="PROFILE_VISITED",
                 )
             )
         elif reason:
             rejections.append(Rejection(display_name, reason, url, email))
     if not contacts:
-        rejections.append(Rejection(display_name, "No visible institutional email", url))
+        contacts.append(
+            FacultyRecord(
+                name=display_name,
+                email="",
+                institution=institution.name,
+                source_url=url,
+                method="Official personal profile",
+                strength=0,
+                profile_url=url,
+                phone=profile_phone,
+                title=profile_title,
+                directory_url=matched_entry.source_url if matched_entry else "",
+                name_source_url=url,
+                phone_source_url=url if profile_phone else "",
+                profile_status="PROFILE_VISITED",
+                email_status="NO_PUBLIC_EMAIL",
+            )
+        )
     return contacts, rejections
 
 
@@ -5068,13 +5521,43 @@ def parse_public_profile_payload(
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
     for email in sorted(raw_emails):
-        ok, reason = classify_institution_email(email, institution)
+        ok, reason = classify_institution_email(
+            email,
+            institution,
+            allow_published_affiliate=True,
+        )
         if ok:
-            contacts.append(Contact(display_name, email, institution.name, profile_url, "Official public profile API", 0))
+            contacts.append(
+                Contact(
+                    display_name,
+                    email,
+                    institution.name,
+                    profile_url,
+                    "Official public profile API",
+                    0,
+                    profile_url=profile_url,
+                    title=matched_entry.title if matched_entry else "",
+                    directory_url=matched_entry.source_url if matched_entry else "",
+                    profile_status="PROFILE_VISITED",
+                )
+            )
         elif reason:
             rejections.append(Rejection(display_name, reason, profile_url, email))
     if not contacts:
-        rejections.append(Rejection(display_name, "No visible institutional email", profile_url))
+        contacts.append(
+            FacultyRecord(
+                display_name,
+                "",
+                institution.name,
+                profile_url,
+                "Official public profile API",
+                0,
+                profile_url=profile_url,
+                title=matched_entry.title if matched_entry else "",
+                directory_url=matched_entry.source_url if matched_entry else "",
+                profile_status="PROFILE_VISITED",
+            )
+        )
     return contacts, rejections
 
 
@@ -5483,40 +5966,40 @@ def crawl_profiles(
         index, link = payload
         url = str(link["url"])
         if not path_allowed(url, disallowed_paths):
-            return [], [], f"Skipped by robots.txt: {url}", None
+            return [], [], "", f"{url}: PROFILE_BLOCKED_BY_ROBOTS"
         session = make_session()
         html, final_url, error = fetch_html(session, url)
         if not html or not final_url:
-            return [], [], "", f"{url}: {error or 'unavailable'}"
+            return [], [], "", f"{url}: PROFILE_FETCH_FAILED ({error or 'unavailable'})"
         if not institution_related_domain(final_url, institution):
-            return [], [], "", None
+            return [], [], "", f"{url}: PROFILE_REDIRECTED_OUTSIDE_OFFICIAL_DOMAIN"
         found_contacts, found_rejections = parse_profile_page(final_url, html, institution, roster_entries)
-        if not found_contacts:
-            payload, payload_error = fetch_public_profile_payload(session, final_url, html)
-            if payload:
+        if not any(record.email for record in found_contacts):
+            api_payload, payload_error = fetch_public_profile_payload(session, final_url, html)
+            if api_payload:
                 api_contacts, api_rejections = parse_public_profile_payload(
                     final_url,
-                    payload,
+                    api_payload,
                     institution,
                     roster_entries,
                 )
                 found_contacts.extend(api_contacts)
                 found_rejections.extend(api_rejections)
             elif payload_error:
-                if delay_seconds > 0 and index < len(profile_links):
-                    time.sleep(delay_seconds)
-                return (
-                    found_contacts,
-                    found_rejections,
-                    f"{final_url}: {len(found_contacts)} contact(s)",
-                    f"{final_url}: {payload_error}",
+                found_rejections.append(
+                    Rejection(
+                        str(link.get("text") or "Unknown profile"),
+                        "PROFILE_API_PARSE_FAILED",
+                        final_url,
+                        payload_error,
+                    )
                 )
         if delay_seconds > 0 and index < len(profile_links):
             time.sleep(delay_seconds)
         return (
             found_contacts,
             found_rejections,
-            f"{final_url}: {len(found_contacts)} contact(s)",
+            f"{final_url}: PROFILE_VISITED ({sum(bool(record.email) for record in found_contacts)} email(s))",
             None,
         )
 
@@ -5529,7 +6012,7 @@ def crawl_profiles(
                 log.append(message)
             if blocked_message:
                 blocked.append(blocked_message)
-    return contacts, rejections, log, blocked
+    return deduplicate_contacts(contacts), rejections, log, blocked
 
 
 def extract_card_level_contacts(
@@ -5592,12 +6075,9 @@ def extract_card_level_contacts(
                 elif reason:
                     rejections.append(Rejection(entry.name, reason, page_url, email))
             if not valid_found:
-                rejections.append(Rejection(entry.name, "No visible institutional email", page_url))
+                continue
             else:
                 matched.add(normalized)
-    for entry in pending:
-        if entry.normalized_name not in matched:
-            rejections.append(Rejection(entry.name, "No precise local card match", entry.source_url))
     return contacts, rejections
 
 
@@ -6303,6 +6783,13 @@ def process_manual_faculty_pages(
         soup = BeautifulSoup(page_html, "html.parser")
         title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
         page_text = clean_text(soup.get_text(" ", strip=True))
+        visible_roster, _ = extract_roster_entries_from_soup(
+            page_url,
+            soup,
+            authoritative=True,
+        )
+        if soup.find("form") and not visible_roster:
+            return False
         matched_terms = text_matches_terms(f"{page_url} {title} {page_text[:12000]}", terms)
         faculty_identity = any(
             marker in fold_text(f"{page_url} {title} {page_text[:5000]}")
@@ -6311,7 +6798,7 @@ def process_manual_faculty_pages(
                 "physician", "professor", "department", "division", "researcher",
             )
         )
-        if not faculty_identity:
+        if not faculty_identity and not visible_roster:
             return False
         classification = classify_official_page(page_url, title, page_text, page_html)
         if classification == "IRRELEVANT":
@@ -6380,7 +6867,6 @@ def process_manual_faculty_pages(
 
             direct_soup = BeautifulSoup(html, "html.parser")
             direct_text = clean_text(direct_soup.get_text(" ", strip=True))
-            direct_emails = decode_visible_emails(str(direct_soup))
             accepted = False
             if directory_needs_browser_traversal(direct_soup, direct_text):
                 update_activity("Reading the complete directory and all result pages...")
@@ -6404,7 +6890,7 @@ def process_manual_faculty_pages(
                 elif render_error:
                     report.notes.append(f"Browser traversal unavailable: {render_error}")
 
-            if not accepted and (direct_emails or matched_allowed_title(direct_text)):
+            if not accepted:
                 accepted = accept_html_page(html, final_url, "manual_faculty_page")
 
             if not accepted:
@@ -6445,11 +6931,14 @@ def process_manual_faculty_pages(
 
     accepted_pages = list({page.url: page for page in accepted_pages}.values())
     report.department_pages = len(accepted_pages)
+    report.directory_urls = [page.url for page in accepted_pages]
     if not accepted_pages:
         if pasted_contacts:
-            report.contacts_found = len(pasted_contacts)
-            report.status = "Verified contacts found"
-            return pasted_contacts, report
+            records = reconcile_faculty_records(
+                [], pasted_contacts, institution, specialty, report
+            )
+            report.status = "Faculty records extracted"
+            return records, report
         report.status = "No valid supplied faculty page"
         return [], report
 
@@ -6462,8 +6951,10 @@ def process_manual_faculty_pages(
         disallowed_paths=disallowed_paths,
         seed_cache=seed_cache,
         allow_browser_traversal=False,
+        authoritative_roster=True,
     )
     report.faculty_roster_entries = len(roster_entries)
+    report.directory_entries_discovered = len(roster_entries)
     report.pages_checked = len(crawl_log)
     report.rejections.extend(role_rejections)
     report.blocked_or_unreadable.extend(blocked)
@@ -6490,7 +6981,6 @@ def process_manual_faculty_pages(
         delay_seconds,
         disallowed_paths,
     )
-    report.profiles_checked = len(profile_log)
     report.rejections.extend(profile_rejections)
     report.blocked_or_unreadable.extend(profile_blocked)
     report.notes.extend(profile_log)
@@ -6519,18 +7009,28 @@ def process_manual_faculty_pages(
         visible_directory_contacts.extend(found_contacts)
         report.rejections.extend(found_rejections)
 
-    contacts = deduplicate_contacts(
+    enriched_records = deduplicate_contacts(
         pasted_contacts
         + profile_contacts
         + card_contacts
         + pdf_contacts
         + visible_directory_contacts
     )
+    records = reconcile_faculty_records(
+        roster_entries,
+        enriched_records,
+        institution,
+        specialty,
+        report,
+        profile_links,
+        profile_log,
+        profile_blocked,
+        authoritative_roster=True,
+    )
     update_activity(f"Finishing {institution.name}...")
-    if contacts:
-        report.contacts_found = len(contacts)
-        report.status = "Verified contacts found"
-        return contacts, report
+    if records:
+        report.status = "Faculty roster completed"
+        return records, report
 
     department_contact = find_generic_department_email(
         accepted_pages,
@@ -6539,12 +7039,13 @@ def process_manual_faculty_pages(
         page_cache,
     )
     if department_contact:
-        report.contacts_found = 1
         report.status = "Generic department contact found"
         report.notes.append(
             "No personal faculty emails were verified on the supplied sources; one department contact returned."
         )
-        return [department_contact], report
+        return reconcile_faculty_records(
+            [], [department_contact], institution, specialty, report
+        ), report
 
     report.status = "No public personal faculty email found"
     return [], report
@@ -6602,22 +7103,24 @@ def process_institution(
             page_cache,
         )
         if department_contact:
-            report.contacts_found = 1
             report.status = "Generic department contact found"
             report.notes.append("No personal faculty emails were verified; one department contact returned.")
-            return [department_contact], report
+            return reconcile_faculty_records(
+                [], [department_contact], institution, specialty, report
+            ), report
         institution_contact = find_institution_conference_contact(
             institution,
             terms,
             disallowed_paths,
         )
         if institution_contact:
-            report.contacts_found = 1
             report.status = "Institution conference contact found"
             report.notes.append(
                 "No personal faculty or department email was verified; the best published institutional contact returned."
             )
-            return [institution_contact], report
+            return reconcile_faculty_records(
+                [], [institution_contact], institution, specialty, report
+            ), report
         return None
 
     update_activity("🔎 Discovering relevant pages...")
@@ -6705,6 +7208,8 @@ def process_institution(
         blocked = []
         report.notes.append("Initial department discovery returned no qualifying page; completeness audit required.")
     report.faculty_roster_entries = len(roster_entries)
+    report.directory_entries_discovered = len(roster_entries)
+    report.directory_urls = sorted({page.url for page in department_pages} | set(faculty_pages))
     report.pages_checked = len(crawl_log)
     report.blocked_or_unreadable.extend(blocked)
     report.rejections.extend(role_rejections)
@@ -6718,6 +7223,7 @@ def process_institution(
     profile_rejections: list[Rejection] = []
     profile_log: list[str] = []
     profile_blocked: list[str] = []
+    profile_links: list[dict[str, object]] = []
     if roster_entries:
         update_activity("🧭 Following relevant faculty links...")
         profile_links = discover_profile_links(page_cache, institution, roster_entries)
@@ -6801,6 +7307,9 @@ def process_institution(
     audit_profile_contacts: list[Contact] = []
     audit_card_contacts: list[Contact] = []
     audit_pdf_contacts: list[Contact] = []
+    audit_profile_links: list[dict[str, object]] = []
+    audit_profile_log: list[str] = []
+    audit_profile_blocked: list[str] = []
     if audit_pages:
         audit_roster, audit_faculty_pages, audit_role_rejections, audit_page_cache, audit_crawl_log, audit_blocked = discover_faculty_roster(
             department_pages=audit_pages,
@@ -6931,6 +7440,9 @@ def process_institution(
         if entry.normalized_name not in covered_before_person_search
     ]
     person_search_contacts: list[Contact] = []
+    person_search_links: list[dict[str, object]] = []
+    person_search_log: list[str] = []
+    person_search_blocked: list[str] = []
     if person_search_roster:
         update_activity("🔎 Auditing each unresolved faculty member...")
         person_search_links, person_search_discovery_log = discover_roster_profile_search_links(
@@ -6961,7 +7473,7 @@ def process_institution(
             )
 
     update_activity(f"✨ Finishing {institution.name}...")
-    personal_contacts = deduplicate_contacts(
+    enriched_records = deduplicate_contacts(
         initial_personal_contacts
         + audit_profile_contacts
         + audit_card_contacts
@@ -6970,10 +7482,19 @@ def process_institution(
         + directory_contacts
         + person_search_contacts
     )
-    if personal_contacts:
-        report.contacts_found = len(personal_contacts)
-        report.status = "Verified contacts found"
-        return personal_contacts, report
+    records = reconcile_faculty_records(
+        roster_entries,
+        enriched_records,
+        institution,
+        specialty,
+        report,
+        [*profile_links, *audit_profile_links, *person_search_links],
+        [*profile_log, *audit_profile_log, *person_search_log],
+        [*profile_blocked, *audit_profile_blocked, *person_search_blocked],
+    )
+    if records:
+        report.status = "Faculty roster completed"
+        return records, report
 
     fallback_result = best_published_fallback(department_pages, page_cache)
     if fallback_result:
@@ -6989,6 +7510,26 @@ def format_elapsed(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {remaining_seconds:02d}s"
     return f"{remaining_seconds}s"
+
+
+def render_app_header(logo_data_url: str = "") -> None:
+    logo_html = (
+        f'<img src="{logo_data_url}" alt="Aventis Conferences">'
+        if logo_data_url
+        else ""
+    )
+    st.markdown(
+        f"""
+        <header class="app-header{' app-header-no-logo' if not logo_data_url else ''}">
+            <div class="app-header-logo">{logo_html}</div>
+            <div class="app-header-copy">
+                <h1>{APP_NAME}</h1>
+                <p>Discover, verify, and reconcile academic faculty rosters with publicly published contact details.</p>
+            </div>
+        </header>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ==================================================
@@ -7067,19 +7608,31 @@ st.markdown(
     .stApp [data-testid="stCaptionContainer"] p {{
         color: #ffffff !important;
     }}
-    .aventis-brand {{
-        display: flex;
+    .app-header {{
+        display: grid;
+        grid-template-columns: minmax(200px, 250px) minmax(0, 1fr);
         align-items: center;
-        margin: 0 0 1rem;
+        gap: 1.75rem;
+        margin: 0 0 1.5rem;
     }}
-    .aventis-brand img {{
+    .app-header-no-logo {{ grid-template-columns: minmax(0, 1fr); }}
+    .app-header-logo img {{
         display: block;
-        width: min(290px, 68vw);
+        width: min(250px, 100%);
         height: auto;
-        background: rgba(255, 255, 255, 0.96);
-        border-radius: 6px;
-        padding: 0.45rem 0.65rem;
-        box-shadow: 0 8px 28px rgba(0, 15, 55, 0.22);
+        object-fit: contain;
+    }}
+    .app-header-copy h1 {{
+        color: #ffffff;
+        font-size: 3rem;
+        line-height: 1.08;
+        margin: 0 0 0.7rem;
+    }}
+    .app-header-copy p {{
+        color: #d8e7f7;
+        font-size: 1rem;
+        line-height: 1.5;
+        margin: 0;
     }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
         background: rgba(7, 20, 53, 0.84);
@@ -7107,7 +7660,12 @@ st.markdown(
     .small-note {{ color: #d8e7f7; font-size: 0.92rem; line-height: 1.45; }}
     @media (max-width: 640px) {{
         .block-container {{ padding-top: 3.75rem; }}
-        h1 {{
+        .app-header {{
+            grid-template-columns: minmax(0, 1fr);
+            gap: 1.2rem;
+        }}
+        .app-header-logo img {{ width: min(240px, 72vw); }}
+        .app-header-copy h1 {{
             font-size: 2.1rem !important;
             line-height: 1.14 !important;
             overflow-wrap: anywhere;
@@ -7130,17 +7688,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-if logo_url:
-    st.markdown(
-        f'<div class="aventis-brand"><img src="{logo_url}" alt="Aventis Conferences"></div>',
-        unsafe_allow_html=True,
-    )
-st.title(APP_NAME)
-st.markdown(
-    '<p class="small-note">Discovers relevant institutions and extracts publicly visible faculty contact details from '
-    'official pages. The final export contains Name, Email, and Phone when published.</p>',
-    unsafe_allow_html=True,
-)
+render_app_header(logo_url)
 
 delay_seconds = DEFAULT_REQUEST_DELAY
 
@@ -7452,30 +8000,40 @@ if reports:
         "No valid supplied faculty page",
     }
     summary_values = {
-        "Institutions Searched": len(reports),
-        "With Contacts": sum(1 for report in reports if report.contacts_found > 0),
-        "Contacts": len(contacts),
-        "No Public Email": sum(
-            1 for report in reports
-            if report.contacts_found == 0 and report.status not in review_statuses
+        "Institutions Processed": len(reports),
+        "Faculty Found": len(contacts),
+        "Profiles Visited": sum(report.profile_requests_succeeded for report in reports),
+        "With Public Email": sum(bool(record.email) for record in contacts),
+        "Without Public Email": sum(not bool(record.email) for record in contacts),
+        "With Phone": sum(bool(record.phone) for record in contacts),
+        "Needs Review": sum(
+            1
+            for report in reports
+            if report.status in review_statuses
+            or report.profile_requests_failed > 0
+            or bool(report.missing_people)
         ),
-        "Needs Review": sum(1 for report in reports if report.status in review_statuses),
     }
     summary_cols = st.columns(len(summary_values))
     for col, (label, value) in zip(summary_cols, summary_values.items()):
         col.metric(label, value)
 
 if reports or contacts:
-    st.subheader("Verified Faculty Contacts")
+    st.subheader("Faculty Roster and Published Contacts")
     output_frame = final_dataframe(contacts)
     if output_frame.empty:
-        st.info("No verified contacts were found for the selected institutions.")
+        st.info("No faculty records were found for the selected institutions.")
     else:
-        st.dataframe(output_frame, use_container_width=True, hide_index=True)
+        st.dataframe(
+            output_frame[["Name", "Title", "Email", "Phone", "Profile"]],
+            column_config={"Profile": st.column_config.LinkColumn("Profile")},
+            use_container_width=True,
+            hide_index=True,
+        )
         st.download_button(
-            "Download CSV",
+            "Download Faculty CSV",
             data=output_frame.to_csv(index=False).encode("utf-8"),
-            file_name="verified_faculty_contacts.csv",
+            file_name="faculty_roster_and_published_contacts.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -7499,8 +8057,16 @@ with st.expander("Diagnostics"):
         )
 
     if reports:
-        st.markdown("**Institution status**")
+        st.markdown("**Extraction Diagnostics**")
         st.dataframe(pd.DataFrame([report.as_row() for report in reports]), use_container_width=True, hide_index=True)
+
+        for report in reports:
+            if report.missing_people:
+                st.warning(
+                    f"Completeness warning for {report.institution}: "
+                    f"{len(report.missing_people)} faculty disappeared during processing."
+                )
+                st.code("\n".join(report.missing_people))
 
         st.markdown("**Research audit log**")
         for report in reports:
@@ -7538,9 +8104,18 @@ with st.expander("Diagnostics"):
                 {
                     "Name": contact.name,
                     "Email": contact.email,
+                    "Phone": contact.phone,
                     "Institution": contact.institution,
+                    "Department": contact.department,
+                    "Title": contact.title,
+                    "Directory URL": contact.directory_url,
                     "Profile URL": contact.profile_url,
+                    "Name Source URL": contact.name_source_url,
                     "Email Source URL": contact.email_source_url,
+                    "Phone Source URL": contact.phone_source_url,
+                    "Profile Status": contact.profile_status,
+                    "Email Status": contact.email_status,
+                    "Phone Status": contact.phone_status,
                     "Evidence": contact.relevance_evidence,
                     "Confidence": contact.confidence,
                 }
@@ -7560,4 +8135,4 @@ with st.expander("Diagnostics"):
 # ==================================================
 
 # Export is handled by the Download CSV button above. The final DataFrame is
-# always built by final_dataframe(), which returns exactly: Name, Email, Phone.
+# always built by final_dataframe(), which preserves the roster and field provenance.
