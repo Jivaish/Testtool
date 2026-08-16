@@ -4,8 +4,9 @@ A ready-to-deploy Streamlit app for finding publicly visible official faculty wo
 
 The app first discovers verified institutions and displays their official website links.
 The default workflow lets the user paste one or more exact department faculty-page URLs
-for each institution; the app then extracts the roster, follows linked official profiles,
-verifies published emails, deduplicates the contacts, and organizes the output. An
+for each institution; the app then renders dynamic directories, follows pagination and
+lazy-loaded results to their natural end, extracts the roster, follows linked official profiles,
+verifies published emails and phones, deduplicates the contacts, and organizes the output. An
 automatic website-search mode remains available as a secondary option.
 
 Public web discovery uses a pluggable search-provider layer backed by DDGS in automatic
@@ -35,10 +36,10 @@ Country selection uses the full ISO country list. The location dropdown combines
 
 ## Output
 
-The final table and downloadable CSV contain exactly two columns:
+The final table and downloadable CSV contain three columns. Phone is left blank when it is not published:
 
 ```text
-Name,Email
+Name,Email,Phone
 ```
 
 If one verified faculty member has two different publicly visible official institutional emails, the app keeps two rows. Generic department fallback emails are never assigned to faculty members.
@@ -53,6 +54,7 @@ Accuracy is prioritized over quantity. A contact is returned only when:
 - the email is an institutional work email, or a professional affiliate email explicitly
   published beside the faculty member on that verified teaching source,
 - the name and email are locally associated on a profile, card, directory row, official PDF, or similar source.
+- any phone number is taken only from the same local person card or profile as the email.
 
 The app never guesses, generates, constructs, infers, or predicts emails from names.
 
@@ -106,7 +108,8 @@ source .venv/bin/activate
    - `packages.txt`
    - `README.md`
    - `.gitignore`
-   - `assets/medical-technology-background.png`
+   - `assets/aventis-logo.png`
+   - `assets/medical-globe-background-4k.jpg`
 3. Go to Streamlit Community Cloud.
 4. Select the repository.
 5. Set the main file path to `app.py`.

@@ -56,6 +56,10 @@ USER_AGENT = (
     "Mozilla/5.0 (compatible; GlobalMedicalFacultyContactFinder/1.0; "
     "+https://streamlit.io)"
 )
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "en-US,en;q=0.9",
@@ -337,10 +341,61 @@ DEPARTMENT_PAGE_WORDS = (
 )
 
 FACULTY_PAGE_WORDS = (
-    "faculty", "people", "staff", "directory", "our team", "academic staff",
-    "teaching staff", "faculty profiles", "faculty directory", "researchers",
-    "professors", "profiles", "profile", "team", "members", "directory",
+    "faculty", "faculty directory", "faculty & staff", "faculty and staff",
+    "faculty members", "faculty profiles", "people", "our people", "people directory",
+    "people profiles", "academic staff", "academic faculty", "academic personnel",
+    "teaching staff", "teaching faculty", "academics", "staff directory", "our staff",
+    "staff members", "staff profiles", "department members", "department directory",
+    "school directory", "college directory", "researchers", "research staff",
+    "research team", "research personnel", "investigators", "principal investigators",
+    "professors", "academic team", "our team", "meet the team", "meet our faculty",
+    "meet our staff", "personnel", "members", "leadership & faculty",
+    "leadership and faculty", "faculty and researchers", "profiles", "profile", "directory",
 )
+
+STRONG_FACULTY_PAGE_WORDS = (
+    "faculty", "faculty directory", "faculty & staff", "faculty and staff",
+    "faculty members", "faculty profiles", "academic staff", "academic faculty",
+    "academic personnel", "teaching staff", "teaching faculty", "researchers",
+    "research staff", "research team", "research personnel", "investigators",
+    "principal investigators", "professors", "meet our faculty",
+    "leadership & faculty", "leadership and faculty", "faculty and researchers",
+)
+
+GENERIC_PERSONNEL_PAGE_WORDS = (
+    "people", "our people", "people directory", "people profiles", "staff",
+    "staff directory", "our staff", "staff members", "staff profiles",
+    "department members", "department directory", "school directory",
+    "college directory", "academic team", "our team", "meet the team",
+    "meet our staff", "personnel", "members", "profiles", "profile", "directory",
+)
+
+FACULTY_PATH_PATTERNS = (
+    "/faculty/", "/people/", "/directory/", "/staff/", "/faculty-staff/",
+    "/faculty-and-staff/", "/academics/", "/academic-staff/", "/researchers/",
+    "/team/", "/profiles/", "/members/",
+)
+
+ACADEMIC_ROLE_EVIDENCE_RE = re.compile(
+    r"\b(?:associate\s+professor|assistant\s+professor|professor|senior\s+lecturer|"
+    r"lecturer|instructor|researcher|research\s+fellow|research\s+scientist|scientist|"
+    r"principal\s+investigator|investigator|dean|department\s+chair|chair|division\s+chief)\b",
+    re.I,
+)
+
+
+def is_academic_personnel_listing(url: str, title: str, page_text: str) -> bool:
+    """Qualify broad people/team pages only when they contain academic roles."""
+    identity = clean_text(f"{url} {title}").casefold()
+    content = clean_text(page_text[:10000]).casefold()
+    role_evidence = bool(ACADEMIC_ROLE_EVIDENCE_RE.search(content))
+    strong_identity = any(word in identity for word in STRONG_FACULTY_PAGE_WORDS)
+    strong_path = any(pattern in f"{urlparse(url).path.casefold()}/" for pattern in FACULTY_PATH_PATTERNS[:1])
+    broad_signal = (
+        any(word in f"{identity} {content}" for word in GENERIC_PERSONNEL_PAGE_WORDS)
+        or any(pattern in f"{urlparse(url).path.casefold()}/" for pattern in FACULTY_PATH_PATTERNS[1:])
+    )
+    return strong_identity or strong_path or (broad_signal and role_evidence)
 
 COUNTRY_NAME_OVERRIDES = {
     "BO": "Bolivia",
@@ -746,6 +801,7 @@ class Contact:
     email_source_url: str = ""
     relevance_evidence: str = ""
     confidence: str = ""
+    phone: str = ""
 
     def __post_init__(self) -> None:
         if not self.email_source_url:
@@ -758,7 +814,7 @@ class Contact:
             self.confidence = "HIGH" if self.strength == 0 else "MEDIUM"
 
     def final_row(self) -> dict[str, str]:
-        return {"Name": self.name, "Email": self.email}
+        return {"Name": self.name, "Email": self.email, "Phone": self.phone}
 
 
 @dataclass
@@ -1010,7 +1066,7 @@ def render_dynamic_html(url: str) -> tuple[str | None, str | None, str | None]:
             if executable:
                 launch_options["executable_path"] = str(executable)
             browser = playwright.chromium.launch(**launch_options)
-            page = browser.new_page(user_agent=USER_AGENT)
+            page = browser.new_page(user_agent=BROWSER_USER_AGENT)
             page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT * 1000)
             page.wait_for_timeout(1200)
             html = page.content()
@@ -1019,6 +1075,222 @@ def render_dynamic_html(url: str) -> tuple[str | None, str | None, str | None]:
             return html, final_url, None
     except Exception as exc:
         return None, url, f"Playwright {exc.__class__.__name__}"
+
+
+def browser_launch_options() -> dict[str, object]:
+    browser_paths = (
+        Path("/usr/bin/chromium"),
+        Path("/usr/bin/chromium-browser"),
+        Path("/usr/bin/google-chrome"),
+        Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+    )
+    executable = next((path for path in browser_paths if path.exists()), None)
+    options: dict[str, object] = {"headless": True}
+    if executable:
+        options["executable_path"] = str(executable)
+    return options
+
+
+def directory_needs_browser_traversal(soup: BeautifulSoup, page_text: str) -> bool:
+    if page_has_js_only_signals(soup, page_text):
+        return True
+    for control in soup.find_all(["a", "button", "input"]):
+        labels = [
+            clean_text(control.get_text(" ", strip=True)).casefold(),
+            clean_text(control.get("aria-label")).casefold(),
+            clean_text(control.get("value")).casefold(),
+        ]
+        href = clean_text(control.get("href")).casefold()
+        if any(
+            re.fullmatch(r"(?:next(?:\s+page)?|load\s+more|more\s+results|show\s+more)", label)
+            for label in labels
+            if label
+        ):
+            if not href or href.startswith("javascript:") or control.name == "button":
+                return True
+    return False
+
+
+def rendered_visible_html(page: object) -> str:
+    """Serialize rendered content without stale or CSS-hidden directory records."""
+    try:
+        return str(page.evaluate(
+            r"""() => {
+                const clone = document.documentElement.cloneNode(true);
+                const originals = Array.from(document.body.querySelectorAll('*'));
+                const copies = Array.from(clone.querySelector('body').querySelectorAll('*'));
+                for (let index = originals.length - 1; index >= 0; index -= 1) {
+                    const element = originals[index];
+                    const style = window.getComputedStyle(element);
+                    const hidden = element.hidden
+                        || element.getAttribute('aria-hidden') === 'true'
+                        || style.display === 'none'
+                        || style.visibility === 'hidden'
+                        || style.visibility === 'collapse'
+                        || Number(style.opacity) === 0
+                        || element.getClientRects().length === 0;
+                    if (hidden && copies[index]) copies[index].remove();
+                }
+                return '<!doctype html>' + clone.outerHTML;
+            }"""
+        ))
+    except Exception:
+        return str(page.content())
+
+
+def render_dynamic_directory_pages(
+    url: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[list[tuple[str, str]], str | None]:
+    """Render a public directory and advance until its own next control ends."""
+    if sync_playwright is None:
+        return [], "Playwright is not available"
+
+    pages: list[tuple[str, str]] = []
+    seen_content: set[tuple[str, int, str, str]] = set()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(**browser_launch_options())
+            page = browser.new_page(user_agent=BROWSER_USER_AGENT, viewport={"width": 1440, "height": 1000})
+            page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT * 1000)
+            query_keys = {key.casefold() for key in parse_qs(urlparse(url).query)}
+            filtered_query = any(
+                marker in key
+                for key in query_keys
+                for marker in ("search", "filter", "criteria", "department", "specialty", "speciality")
+            )
+            settle_rounds = 0
+            elapsed_ms = 0
+            baseline_state = tuple(page.evaluate(
+                r"""() => [
+                    document.querySelectorAll('a[href^="mailto:"]').length,
+                    Array.from(document.querySelectorAll('a[href*="/profile"], a[href*="/people/"], a[href*="/directory/"]'))
+                        .map((link) => link.getAttribute('href') || '')
+                        .join('|'),
+                    document.body ? document.body.innerText.match(/Page\s+\d+\s+of\s+\d+/i)?.[0] || '' : ''
+                ]"""
+            ))
+            previous_initial_state = baseline_state
+            saw_filtered_transition = False
+            minimum_settle_ms = 2500
+            maximum_settle_ms = 15000 if filtered_query else 6000
+            while elapsed_ms < maximum_settle_ms:
+                page.wait_for_timeout(500)
+                elapsed_ms += 500
+                initial_state = tuple(page.evaluate(
+                    r"""() => [
+                        document.querySelectorAll('a[href^="mailto:"]').length,
+                        Array.from(document.querySelectorAll('a[href*="/profile"], a[href*="/people/"], a[href*="/directory/"]'))
+                            .map((link) => link.getAttribute('href') || '')
+                            .join('|'),
+                        document.body ? document.body.innerText.match(/Page\s+\d+\s+of\s+\d+/i)?.[0] || '' : ''
+                    ]"""
+                ))
+                if initial_state == previous_initial_state:
+                    settle_rounds += 1
+                else:
+                    settle_rounds = 0
+                    if initial_state != baseline_state:
+                        saw_filtered_transition = True
+                previous_initial_state = initial_state
+                if (
+                    elapsed_ms >= minimum_settle_ms
+                    and settle_rounds >= 4
+                    and (not filtered_query or saw_filtered_transition)
+                ):
+                    break
+
+            while True:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=4000)
+                except Exception:
+                    page.wait_for_timeout(700)
+
+                stable_scrolls = 0
+                previous_record_state: tuple[object, ...] | None = None
+                while stable_scrolls < 2:
+                    page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+                    page.wait_for_timeout(550)
+                    record_state = tuple(page.evaluate(
+                        """() => [
+                            document.querySelectorAll('a[href^="mailto:"]').length,
+                            Array.from(document.querySelectorAll('a[href*="/profile"], a[href*="/people/"], a[href*="/directory/"]'))
+                                .map((link) => link.getAttribute('href') || '')
+                                .join('|'),
+                            document.querySelectorAll('article, [class*="person" i], [class*="profile" i], [class*="result" i], [class*="faculty" i]').length
+                        ]"""
+                    ))
+                    if record_state == previous_record_state:
+                        stable_scrolls += 1
+                    else:
+                        stable_scrolls = 0
+                    previous_record_state = record_state
+
+                html = rendered_visible_html(page)
+                final_url = normalize_url(page.url) or page.url
+                signature = (final_url, len(html), html[:1200], html[-1200:])
+                if signature in seen_content:
+                    break
+                seen_content.add(signature)
+                pages.append((html, final_url))
+                if progress_callback:
+                    progress_callback(f"Reading directory result page {len(pages)}...")
+
+                page_counter = re.search(
+                    r"\bPage\s+(\d+)\s+of\s+(\d+)\b",
+                    clean_text(BeautifulSoup(html, "html.parser").get_text(" ", strip=True)),
+                    flags=re.I,
+                )
+                if page_counter and int(page_counter.group(1)) >= int(page_counter.group(2)):
+                    break
+
+                next_control = None
+                next_name = re.compile(
+                    r"^(?:next(?:\s+page)?|load\s+more|more\s+results|show\s+more)$",
+                    re.I,
+                )
+                for role in ("link", "button"):
+                    controls = page.get_by_role(role, name=next_name)
+                    for index in range(controls.count()):
+                        control = controls.nth(index)
+                        try:
+                            class_name = clean_text(control.get_attribute("class")).casefold()
+                            aria_disabled = clean_text(control.get_attribute("aria-disabled")).casefold()
+                            if (
+                                not control.is_visible()
+                                or control.is_disabled()
+                                or aria_disabled == "true"
+                                or "disabled" in class_name
+                            ):
+                                continue
+                        except Exception:
+                            continue
+                        next_control = control
+                        break
+                    if next_control is not None:
+                        break
+
+                if next_control is None:
+                    break
+
+                before_url = page.url
+                before_html = html
+                try:
+                    next_control.scroll_into_view_if_needed()
+                    next_control.click(timeout=8000)
+                    page.wait_for_timeout(900)
+                except Exception:
+                    break
+                after_html = page.content()
+                if page.url == before_url and after_html == before_html:
+                    break
+
+            browser.close()
+        return pages, None
+    except Exception as exc:
+        return pages, f"Playwright {exc.__class__.__name__}"
 
 
 def is_pdf_url(url: str) -> bool:
@@ -2335,9 +2607,8 @@ def relevance_score(url: str, title: str, page_text: str, terms: list[str]) -> i
     score = 0
     score += 30 * len(text_matches_terms(combined, terms))
     score += 12 * sum(word in combined for word in DEPARTMENT_PAGE_WORDS)
-    score += 14 * sum(word in combined for word in FACULTY_PAGE_WORDS)
-    if any(word in combined for word in ("faculty", "people", "directory", "profile")):
-        score += 18
+    if is_academic_personnel_listing(url, title, page_text):
+        score += 36
     return score
 
 
@@ -2367,7 +2638,7 @@ def classify_official_page(
         or any(marker in path for marker in ("/profile/", "/profiles/", "/person/", "/provider/"))
     ):
         return "PERSON_PROFILE"
-    if any(marker in header for marker in ("faculty directory", "our faculty", "faculty staff", "our team")):
+    if is_academic_personnel_listing(url, title, page_text):
         return "FACULTY_DIRECTORY"
     if "division" in header or "/division" in path:
         return "DIVISION"
@@ -3355,6 +3626,14 @@ ALLOWED_TITLE_PATTERNS = [
     r"\bteaching\s+faculty\b",
     r"\bresearch\s+faculty\b",
     r"\bacademic\s+researcher\b",
+    r"\bresearcher\b",
+    r"\bresearch\s+fellow\b",
+    r"\bresearch\s+scientist\b",
+    r"\bscientist\b",
+    r"\bprincipal\s+investigator\b",
+    r"\binvestigator\b",
+    r"\bdean\b",
+    r"\bchair\b",
     r"\bdepartment\s+chair\b",
     r"\bdivision\s+chief\b",
     r"\bprogram\s+director\b",
@@ -3372,7 +3651,8 @@ EXCLUSION_REASON_PATTERNS = [
     (r"\bvisiting\s+(?:faculty|professor|scholar)\b", "Visiting faculty"),
     (r"\bresident\b", "Resident"),
     (
-        r"\b(?:clinical\s+|postdoctoral\s+|research\s+)?fellow\b"
+        r"\b(?:clinical\s+|postdoctoral\s+)?fellow\b"
+        r"(?<!research\sfellow)"
         r"(?!\s+of\s+the\s+(?:american|royal|national|international)\b)",
         "Fellow",
     ),
@@ -3404,6 +3684,7 @@ def strip_credentials(value: str) -> str:
 
 def clean_name(value: str) -> str:
     value = clean_text(value)
+    value = value.translate(str.maketrans("", "", "\ufffd\u201c\u201d\u201e\u201f\""))
     value = re.sub(r"^(?:Dr\.?|Prof\.?|Professor|Mr\.?|Ms\.?|Mrs\.?)\s+", "", value, flags=re.I)
     value = re.sub(r"\s+[|\-:]\s+.*$", "", value)
     value = strip_credentials(value)
@@ -3514,6 +3795,15 @@ NAME_SELECTORS = (
 )
 
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,63}\b", re.I)
+PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s.\-/]?)?(?:\(?\d{2,4}\)?[\s.\-/]?){2,4}\d{2,4}"
+    r"(?:\s*(?:x|ext\.?|extension)\s*\d{1,8})?(?!\w)",
+    re.I,
+)
+PHONE_CONTEXT_RE = re.compile(
+    r"\b(?:phone|telephone|tel|office|direct|mobile|cell|phone-solid)\b",
+    re.I,
+)
 
 OBFUSCATION_REPLACEMENTS = [
     (r"\s*\[\s*at\s*\]\s*", "@"),
@@ -3529,10 +3819,55 @@ def decode_visible_emails(text: str) -> set[str]:
     original = text or ""
     values = {email.lower().strip(".,;:()[]<>") for email in EMAIL_RE.findall(original)}
     candidate = clean_text(original)
+    candidate = re.sub(r"(?<=\w)\s*@\s*(?=[A-Z0-9])", "@", candidate, flags=re.I)
     for pattern, replacement in OBFUSCATION_REPLACEMENTS:
         candidate = re.sub(pattern, replacement, candidate, flags=re.I)
     values.update(email.lower().strip(".,;:()[]<>") for email in EMAIL_RE.findall(candidate))
     return {trim_run_on_email(email) for email in values if email}
+
+
+def normalize_phone(value: str) -> str:
+    candidate = clean_text(value).strip(" ,;|[]<>")
+    candidate = re.sub(
+        r"^(?:phone|telephone|tel|office(?:\s+phone)?|direct|mobile|cell)\s*[:.\-]?\s*",
+        "",
+        candidate,
+        flags=re.I,
+    )
+    phone_match = PHONE_RE.search(candidate)
+    if phone_match:
+        candidate = phone_match.group(0)
+    digits = re.sub(r"\D", "", re.sub(r"(?:x|ext\.?|extension)\s*\d+$", "", candidate, flags=re.I))
+    if not 7 <= len(digits) <= 15:
+        return ""
+    return candidate.strip(" ,;|")
+
+
+def extract_phone_from_text(value: str) -> str:
+    text = value or ""
+    candidates: list[tuple[int, str]] = []
+    for match in PHONE_RE.finditer(text):
+        phone = normalize_phone(match.group(0))
+        if not phone:
+            continue
+        context = text[max(0, match.start() - 70): min(len(text), match.end() + 70)]
+        if not PHONE_CONTEXT_RE.search(context):
+            continue
+        label_before = bool(PHONE_CONTEXT_RE.search(text[max(0, match.start() - 35):match.start()]))
+        candidates.append((20 if label_before else 10, phone))
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def extract_phone_from_node(node: BeautifulSoup | Tag) -> str:
+    for anchor in node.select('a[href^="tel:" i]'):
+        phone = normalize_phone(anchor.get_text(" ", strip=True)) or normalize_phone(
+            (anchor.get("href") or "")[4:].split("?", 1)[0]
+        )
+        if phone:
+            return phone
+    return extract_phone_from_text(node.get_text(" ", strip=True))
 
 
 def decode_protected_script_emails(node: BeautifulSoup | Tag) -> set[str]:
@@ -3707,6 +4042,7 @@ def discover_faculty_roster(
     delay_seconds: float,
     disallowed_paths: list[str],
     seed_cache: dict[str, str] | None = None,
+    allow_browser_traversal: bool = True,
 ) -> tuple[list[FacultyEntry], list[str], list[Rejection], dict[str, str], list[str], list[str]]:
     queue: deque[str] = deque()
     scheduled: set[str] = set()
@@ -3716,6 +4052,7 @@ def discover_faculty_roster(
     faculty_pages: list[str] = []
     rejections: list[Rejection] = []
     page_cache: dict[str, str] = dict(seed_cache or {})
+    browser_rendered_urls: set[str] = set()
     log: list[str] = []
     blocked: list[str] = []
 
@@ -3784,17 +4121,30 @@ def discover_faculty_roster(
                         "faculty", "people", "directory", "provider", "physician", "our team",
                     )
                 )
-                if dynamic_directory and page_has_js_only_signals(raw_soup, raw_text):
-                    rendered_html, rendered_url, render_error = render_dynamic_html(final_url)
-                    if (
-                        rendered_html
-                        and rendered_url
-                        and institution_related_domain(rendered_url, institution)
-                    ):
-                        html = rendered_html
-                        final_url = rendered_url
-                        page_cache[final_url] = html
-                        log.append(f"Rendered JavaScript directory: {final_url}")
+                needs_browser = directory_needs_browser_traversal(raw_soup, raw_text)
+                if (
+                    allow_browser_traversal
+                    and dynamic_directory
+                    and needs_browser
+                    and final_url not in browser_rendered_urls
+                ):
+                    rendered_pages, render_error = render_dynamic_directory_pages(final_url)
+                    valid_rendered_pages = [
+                        (rendered_html, rendered_url)
+                        for rendered_html, rendered_url in rendered_pages
+                        if institution_related_domain(rendered_url, institution)
+                    ]
+                    if valid_rendered_pages:
+                        html, final_url = valid_rendered_pages[0]
+                        for rendered_html, rendered_url in valid_rendered_pages:
+                            normalized_rendered = normalize_url(rendered_url) or rendered_url
+                            browser_rendered_urls.add(normalized_rendered)
+                            page_cache[normalized_rendered] = rendered_html
+                        for _, rendered_url in valid_rendered_pages[1:]:
+                            enqueue(rendered_url)
+                        log.append(
+                            f"Rendered complete JavaScript directory: {len(valid_rendered_pages)} page(s)"
+                        )
                     else:
                         log.append(
                             f"Possible JavaScript-only directory: {final_url} "
@@ -3813,7 +4163,8 @@ def discover_faculty_roster(
                 title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
                 page_text = clean_text(soup.get_text(" ", strip=True))
                 combined_header = f"{final_url} {title}".lower()
-                if any(word in combined_header for word in FACULTY_PAGE_WORDS):
+                is_faculty_listing = is_academic_personnel_listing(final_url, title, page_text)
+                if is_faculty_listing:
                     faculty_pages.append(final_url)
 
                 page_has_terms = bool(text_matches_terms(f"{final_url} {title} {page_text}", terms))
@@ -3829,7 +4180,6 @@ def discover_faculty_roster(
                             )
                     rejections.extend(found_rejections)
 
-                is_faculty_listing = any(word in combined_header for word in FACULTY_PAGE_WORDS)
                 if is_faculty_listing:
                     for page_link in find_pagination_links(soup, final_url):
                         enqueue(page_link)
@@ -4509,8 +4859,14 @@ def deduplicate_contacts(contacts: list[Contact]) -> list[Contact]:
     for contact in contacts:
         email_key = contact.email.strip().lower()
         existing = by_email.get(email_key)
-        if not existing or contact.strength < existing.strength:
+        if not existing:
             by_email[email_key] = contact
+            continue
+        preferred = contact if contact.strength < existing.strength else existing
+        alternate = existing if preferred is contact else contact
+        if not preferred.phone and alternate.phone:
+            preferred.phone = alternate.phone
+        by_email[email_key] = preferred
 
     by_exact_row: dict[tuple[str, str], Contact] = {}
     for contact in by_email.values():
@@ -4524,10 +4880,10 @@ def deduplicate_contacts(contacts: list[Contact]) -> list[Contact]:
 
 def final_dataframe(contacts: list[Contact]) -> pd.DataFrame:
     rows = [contact.final_row() for contact in deduplicate_contacts(contacts)]
-    frame = pd.DataFrame(rows, columns=["Name", "Email"])
+    frame = pd.DataFrame(rows, columns=["Name", "Email", "Phone"])
     if frame.empty:
         return frame
-    frame = frame.dropna()
+    frame = frame.fillna("")
     frame = frame[(frame["Name"].str.strip() != "") & (frame["Email"].str.strip() != "")]
     frame = frame.drop_duplicates().sort_values(["Name", "Email"], kind="stable")
     return frame.reset_index(drop=True)
@@ -4613,6 +4969,16 @@ def parse_profile_page(
     display_name = matched_entry.name if matched_entry else clean_name(name)
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
+    profile_phone = next(
+        (
+            normalized
+            for label, values in labeled_fields.items()
+            if "phone" in label or label in {"telephone", "tel", "mobile", "cell", "direct"}
+            for value in values
+            if (normalized := normalize_phone(value))
+        ),
+        extract_phone_from_text(page_text),
+    )
     contexts = extract_emails_with_context(soup, page_text)
     for email in protected_emails:
         contexts.setdefault(email, []).append({
@@ -4629,7 +4995,17 @@ def parse_profile_page(
             continue
         ok, reason = classify_institution_email(email, institution)
         if ok:
-            contacts.append(Contact(display_name, email, institution.name, url, "Official personal profile", 0))
+            contacts.append(
+                Contact(
+                    display_name,
+                    email,
+                    institution.name,
+                    url,
+                    "Official personal profile",
+                    0,
+                    phone=profile_phone,
+                )
+            )
         elif reason:
             rejections.append(Rejection(display_name, reason, url, email))
     if not contacts:
@@ -5202,7 +5578,17 @@ def extract_card_level_contacts(
                 )
                 if ok:
                     valid_found = True
-                    contacts.append(Contact(entry.name, email, institution.name, page_url, "Faculty directory card", 1))
+                    contacts.append(
+                        Contact(
+                            entry.name,
+                            email,
+                            institution.name,
+                            page_url,
+                            "Faculty directory card",
+                            1,
+                            phone=extract_phone_from_node(node),
+                        )
+                    )
                 elif reason:
                     rejections.append(Rejection(entry.name, reason, page_url, email))
             if not valid_found:
@@ -5638,6 +6024,7 @@ def extract_contacts_from_directory_text(
 ) -> tuple[list[Contact], list[Rejection]]:
     """Pair each visible institutional email with the nearest preceding person name."""
     text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?<=\w)\s*@\s*(?=[A-Z0-9])", "@", text, flags=re.I)
     matches = list(EMAIL_RE.finditer(text))
     contacts: list[Contact] = []
     rejections: list[Rejection] = []
@@ -5695,7 +6082,129 @@ def extract_contacts_from_directory_text(
         if not accepted:
             rejections.append(Rejection(name, email_reason or "Invalid institutional email", source_url, email))
             continue
-        contacts.append(Contact(name, email, institution.name, source_url, method, 2))
+        contacts.append(
+            Contact(
+                name,
+                email,
+                institution.name,
+                source_url,
+                method,
+                2,
+                phone=extract_phone_from_text(segment[-900:]),
+            )
+        )
+    return deduplicate_contacts(contacts), rejections
+
+
+def extract_contacts_from_directory_html(
+    page_html: str,
+    institution: Institution,
+    source_url: str,
+    method: str,
+    include_excluded_roles: bool = True,
+    allow_published_affiliate: bool = False,
+) -> tuple[list[Contact], list[Rejection]]:
+    """Extract contacts from the smallest person card surrounding each mail link."""
+    soup = BeautifulSoup(page_html or "", "html.parser")
+    contacts: list[Contact] = []
+    rejections: list[Rejection] = []
+    processed_emails: set[str] = set()
+
+    def person_name_from_block(block: Tag) -> str:
+        candidates: list[tuple[int, str]] = []
+        for person_link in block.find_all("a", href=True):
+            href = clean_text(person_link.get("href"))
+            if href.casefold().startswith(("mailto:", "tel:")):
+                continue
+            label = clean_text(person_link.get_text(" ", strip=True))
+            name = clean_name(label)
+            if not valid_name(name):
+                continue
+            target = normalize_url(urljoin(source_url, href))
+            score = 20
+            if target and looks_like_profile_url(target, label):
+                score += 100
+            if any(token in label for token in (", M", ", D", ", Ph", ", RN", ", MB")):
+                score += 15
+            candidates.append((score, name))
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+        return extract_name_from_node(block) or ""
+
+    for anchor in soup.select('a[href^="mailto:" i]'):
+        href = clean_text(anchor.get("href"))
+        address_values = decode_visible_emails(
+            f"{href[7:].split('?', 1)[0]} {anchor.get_text(' ', strip=True)}"
+        )
+        if not address_values:
+            continue
+
+        local_block: Tag | None = None
+        local_name = ""
+        current: Tag = anchor
+        for _ in range(8):
+            parent = current.parent
+            if not isinstance(parent, Tag):
+                break
+            current = parent
+            block_text = clean_text(current.get_text(" ", strip=True))
+            if not 10 <= len(block_text) <= 3000:
+                continue
+            candidate_name = person_name_from_block(current)
+            if not candidate_name:
+                continue
+            block_emails = emails_in_local_block(current, block_text)
+            if not address_values.intersection(block_emails):
+                continue
+            local_block = current
+            local_name = candidate_name
+            if len(collect_names_in_node(current)) == 1:
+                break
+
+        if local_block is None or not valid_name(local_name):
+            continue
+        block_text = clean_text(local_block.get_text(" ", strip=True))
+        if not include_excluded_roles:
+            role_reason = excluded_role_reason(block_text)
+            if role_reason:
+                for email in address_values:
+                    rejections.append(Rejection(local_name, role_reason, source_url, email))
+                continue
+
+        phone = extract_phone_from_node(local_block)
+        for email in sorted(address_values):
+            if email in processed_emails:
+                continue
+            accepted, reason = classify_institution_email(
+                email,
+                institution,
+                allow_published_affiliate=allow_published_affiliate,
+            )
+            if accepted:
+                contacts.append(
+                    Contact(
+                        clean_name(local_name),
+                        email,
+                        institution.name,
+                        source_url,
+                        method,
+                        1,
+                        phone=phone,
+                    )
+                )
+                processed_emails.add(email)
+            elif reason:
+                rejections.append(Rejection(local_name, reason, source_url, email))
+
+    text_contacts, text_rejections = extract_contacts_from_directory_text(
+        soup.get_text("\n", strip=True),
+        institution,
+        source_url,
+        method,
+        include_excluded_roles=include_excluded_roles,
+    )
+    contacts.extend(text_contacts)
+    rejections.extend(text_rejections)
     return deduplicate_contacts(contacts), rejections
 
 
@@ -5873,7 +6382,29 @@ def process_manual_faculty_pages(
             direct_text = clean_text(direct_soup.get_text(" ", strip=True))
             direct_emails = decode_visible_emails(str(direct_soup))
             accepted = False
-            if direct_emails or matched_allowed_title(direct_text):
+            if directory_needs_browser_traversal(direct_soup, direct_text):
+                update_activity("Reading the complete directory and all result pages...")
+                rendered_pages, render_error = render_dynamic_directory_pages(
+                    source_url,
+                    update_activity,
+                )
+                for rendered_html, rendered_url in rendered_pages:
+                    if not authorize_manual_source_domain(institution, rendered_url, region, terms):
+                        continue
+                    accepted = accept_html_page(
+                        rendered_html,
+                        rendered_url,
+                        "complete_rendered_directory",
+                    ) or accepted
+                if rendered_pages:
+                    report.notes.append(
+                        f"Browser traversal reached the directory's natural end after "
+                        f"{len(rendered_pages)} result page(s)."
+                    )
+                elif render_error:
+                    report.notes.append(f"Browser traversal unavailable: {render_error}")
+
+            if not accepted and (direct_emails or matched_allowed_title(direct_text)):
                 accepted = accept_html_page(html, final_url, "manual_faculty_page")
 
             if not accepted:
@@ -5930,13 +6461,7 @@ def process_manual_faculty_pages(
         delay_seconds=delay_seconds,
         disallowed_paths=disallowed_paths,
         seed_cache=seed_cache,
-    )
-    roster_entries = filter_roster_to_location(
-        roster_entries,
-        country_code,
-        region,
-        region_code,
-        region_kind,
+        allow_browser_traversal=False,
     )
     report.faculty_roster_entries = len(roster_entries)
     report.pages_checked = len(crawl_log)
@@ -5984,11 +6509,12 @@ def process_manual_faculty_pages(
     visible_directory_contacts: list[Contact] = []
     for page_url, page_html in page_cache.items():
         page_soup = BeautifulSoup(page_html, "html.parser")
-        found_contacts, found_rejections = extract_contacts_from_directory_text(
-            page_soup.get_text("\n", strip=True),
+        found_contacts, found_rejections = extract_contacts_from_directory_html(
+            page_html,
             institution,
             page_url,
             "Visible faculty directory",
+            allow_published_affiliate=True,
         )
         visible_directory_contacts.extend(found_contacts)
         report.rejections.extend(found_rejections)
@@ -6229,8 +6755,8 @@ def process_institution(
                 continue
             if not matched_allowed_title(page_text):
                 continue
-            contacts, rejections = extract_contacts_from_directory_text(
-                page_soup.get_text("\n", strip=True),
+            contacts, rejections = extract_contacts_from_directory_html(
+                page_html,
                 institution,
                 page_url,
                 "Visible official faculty directory",
@@ -6478,23 +7004,30 @@ st.set_page_config(
 
 app_directory = Path(__file__).parent
 watermark_paths = (
+    app_directory / "assets" / "medical-globe-background-4k.jpg",
+    app_directory / "assets" / "medical-globe-background-hd.png",
     app_directory / "assets" / "medical-technology-background.png",
     app_directory / "medical-technology-background.png",
 )
 watermark_path = next((path for path in watermark_paths if path.exists()), None)
 if watermark_path:
     watermark_data = base64.b64encode(watermark_path.read_bytes()).decode("ascii")
-    watermark_mime = "image/png"
+    watermark_mime = "image/jpeg" if watermark_path.suffix.lower() in {".jpg", ".jpeg"} else "image/png"
 else:
     watermark_data = EMBEDDED_BACKGROUND_WEBP
     watermark_mime = "image/webp"
 watermark_url = f'data:{watermark_mime};base64,{watermark_data}'
+logo_path = app_directory / "assets" / "aventis-logo.png"
+logo_url = ""
+if logo_path.exists():
+    logo_data = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+    logo_url = f"data:image/png;base64,{logo_data}"
 
 st.markdown(
     f"""
     <style>
-    .stApp {{ background: #11161c; }}
-    header[data-testid="stHeader"] {{ background: rgba(17, 22, 28, 0.96); }}
+    .stApp {{ background: #071b50; }}
+    header[data-testid="stHeader"] {{ background: rgba(4, 17, 54, 0.78); }}
     .stApp::before {{
         content: "";
         position: fixed;
@@ -6502,12 +7035,20 @@ st.markdown(
         z-index: 0;
         pointer-events: none;
         background-image: url("{watermark_url}");
-        background-position: right 1rem top 5rem;
-        background-size: min(720px, 54vw) auto;
+        background-position: center center;
+        background-size: cover;
         background-repeat: no-repeat;
-        filter: grayscale(0.72) saturate(0.45) brightness(0.72);
-        opacity: 0.2;
+        filter: saturate(1.08) contrast(1.03);
+        opacity: 0.86;
         animation: medical-background-drift 24s ease-in-out infinite alternate;
+    }}
+    .stApp::after {{
+        content: "";
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        background: linear-gradient(90deg, rgba(3, 15, 49, 0.9) 0%, rgba(3, 19, 58, 0.72) 48%, rgba(3, 19, 58, 0.35) 100%);
     }}
     .stApp > * {{ position: relative; z-index: 1; }}
     @keyframes medical-background-drift {{
@@ -6517,10 +7058,32 @@ st.markdown(
     @media (prefers-reduced-motion: reduce) {{
         .stApp::before {{ animation: none; }}
     }}
-    .block-container {{ max-width: 1180px; padding-top: 1.5rem; }}
+    .block-container {{ max-width: 1180px; padding-top: 4rem; }}
+    .stApp h1,
+    .stApp h2,
+    .stApp h3,
+    .stApp [data-testid="stWidgetLabel"] p,
+    .stApp [data-testid="stExpander"] summary,
+    .stApp [data-testid="stCaptionContainer"] p {{
+        color: #ffffff !important;
+    }}
+    .aventis-brand {{
+        display: flex;
+        align-items: center;
+        margin: 0 0 1rem;
+    }}
+    .aventis-brand img {{
+        display: block;
+        width: min(290px, 68vw);
+        height: auto;
+        background: rgba(255, 255, 255, 0.96);
+        border-radius: 6px;
+        padding: 0.45rem 0.65rem;
+        box-shadow: 0 8px 28px rgba(0, 15, 55, 0.22);
+    }}
     div[data-testid="stVerticalBlockBorderWrapper"] {{
-        background: rgba(17, 22, 28, 0.93);
-        backdrop-filter: blur(7px);
+        background: rgba(7, 20, 53, 0.84);
+        backdrop-filter: blur(9px);
     }}
     button[data-testid="stBaseButton-primary"] {{
         background: #0877b9;
@@ -6541,7 +7104,7 @@ st.markdown(
     div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
         color: #101828;
     }}
-    .small-note {{ color: #9ba7ba; font-size: 0.92rem; line-height: 1.45; }}
+    .small-note {{ color: #d8e7f7; font-size: 0.92rem; line-height: 1.45; }}
     @media (max-width: 640px) {{
         .block-container {{ padding-top: 3.75rem; }}
         h1 {{
@@ -6555,19 +7118,27 @@ st.markdown(
             overflow-wrap: anywhere;
         }}
         .stApp::before {{
-            background-position: right -10rem top 6rem;
-            background-size: auto 66vh;
-            opacity: 0.12;
+            background-position: 62% center;
+            background-size: cover;
+            opacity: 0.72;
+        }}
+        .stApp::after {{
+            background: rgba(3, 17, 52, 0.73);
         }}
     }}
     </style>
     """,
     unsafe_allow_html=True,
 )
+if logo_url:
+    st.markdown(
+        f'<div class="aventis-brand"><img src="{logo_url}" alt="Aventis Conferences"></div>',
+        unsafe_allow_html=True,
+    )
 st.title(APP_NAME)
 st.markdown(
-    '<p class="small-note">Discovers relevant institutions and extracts publicly visible faculty work emails from '
-    'official pages. The final export contains exactly two columns: Name and Email.</p>',
+    '<p class="small-note">Discovers relevant institutions and extracts publicly visible faculty contact details from '
+    'official pages. The final export contains Name, Email, and Phone when published.</p>',
     unsafe_allow_html=True,
 )
 
@@ -6989,4 +7560,4 @@ with st.expander("Diagnostics"):
 # ==================================================
 
 # Export is handled by the Download CSV button above. The final DataFrame is
-# always built by final_dataframe(), which returns exactly: Name, Email.
+# always built by final_dataframe(), which returns exactly: Name, Email, Phone.
